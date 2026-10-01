@@ -116,8 +116,11 @@ import { configureRemoteServerUpdater } from './runtime/remote-server-updater'
 import type { UpdateCheckOptions } from '../shared/types'
 import { recordUpdaterLifecycle } from './updater-lifecycle-diagnostics'
 import {
+  cancelServeUserQuit,
   installServeSupervisorDisconnectQuit,
-  notifyServeSupervisorReady
+  markServeUserQuit,
+  notifyServeSupervisorReady,
+  notifyServeSupervisorUserQuit
 } from './serve-update-handoff'
 import {
   configureElectronNetworkCompatibility,
@@ -1244,14 +1247,21 @@ function openSettingsFromSystemMenu(): void {
   pendingOpenSettings.mark(targetWindow.webContents.id, Number.POSITIVE_INFINITY)
 }
 
-function quitFromSystemTray(): void {
+function requestUserQuit(): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
     // Why: a hidden session may veto shutdown with a save/discard prompt, so make the window visible.
     showMainWindowFromTray()
   }
   // Why: set the quit latch before app.quit() so the 'close' handler tears down instead of re-hiding to tray.
+  markServeUserQuit()
   isQuitting = true
-  app.quit()
+  try {
+    app.quit()
+  } catch (error) {
+    cancelServeUserQuit()
+    isQuitting = false
+    throw error
+  }
 }
 
 // Why: menu/tray are clickable before anything else configures the updater.
@@ -1275,7 +1285,7 @@ function getSystemTrayOptions(): SystemTrayOptions | null {
       showMainWindowFromTray()
       runUserInitiatedUpdateCheck()
     },
-    onQuit: quitFromSystemTray
+    onQuit: requestUserQuit
   }
 }
 
@@ -1348,6 +1358,7 @@ function openMainWindow(options: { revealOnDidFinishLoad?: boolean } = {}): Brow
     getIsQuitting: () => isQuitting,
     onQuitAborted: () => {
       isQuitting = false
+      cancelServeUserQuit()
       clearExpectedRendererReload()
     },
     onRendererProcessGone: (details, webContentsId) => {
@@ -2895,6 +2906,7 @@ void app.whenReady().then(async () => {
 
   registerAppMenu({
     appMenuLabel: devInstanceIdentity.name,
+    onQuit: requestUserQuit,
     onCheckForUpdates: (options) => runUserInitiatedUpdateCheck(options),
     onBeforeReload: ({ ignoreCache, webContentsId }) => {
       if (mainWindow?.webContents.id === webContentsId) {
@@ -3237,6 +3249,7 @@ app.on('will-quit', (e) => {
   // Why: renderer guards can still cancel before this committed phase; `log stream` must survive those vetoes.
   stopTccPromptNotice()
   const updateQuitInProgress = isQuittingForUpdate()
+  const serveUserQuitNotification = notifyServeSupervisorUserQuit(isServeMode, updateQuitInProgress)
   if (updateQuitInProgress) {
     recordUpdaterLifecycle(
       'will_quit_cleanup_started',
@@ -3312,6 +3325,7 @@ app.on('will-quit', (e) => {
   // Losing at most the last debounce interval beats a quit that never completes, and the
   // temp+rename swap means a write cut short by the deadline leaves the old file intact.
   settleTeardownWithinDeadline([
+    { name: 'serve-user-quit', promise: serveUserQuitNotification },
     { name: 'daemon', promise: daemonTeardown },
     { name: 'runtime-rpc', promise: rpcStopAndClear },
     { name: 'watchers', promise: watcherShutdown },

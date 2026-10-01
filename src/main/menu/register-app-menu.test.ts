@@ -72,6 +72,21 @@ function getSubmenu(
 }
 
 describe('registerAppMenu', () => {
+  it.runIf(!isMac)('routes File Exit through the provided explicit quit callback', () => {
+    const onQuit = vi.fn()
+    registerAppMenu({ ...buildMenuOptions(), onQuit })
+    const exitItem = getSubmenu(getTemplate(), 'File').find((item) => item.label === 'Exit')
+
+    expect(exitItem).toBeDefined()
+    expect(exitItem?.role).toBeUndefined()
+    expect(exitItem?.accelerator).toBe(
+      process.platform === 'linux' ? 'CommandOrControl+Q' : undefined
+    )
+    expect(exitItem?.click).toBeTypeOf('function')
+    exitItem?.click?.({} as never, {} as never, {} as never)
+    expect(onQuit).toHaveBeenCalledOnce()
+  })
+
   it('toggles missing default-on appearance settings from visible to hidden', () => {
     expect(getNextDefaultOnAppearanceSettingValue(undefined)).toBe(false)
     expect(getNextDefaultOnAppearanceSettingValue(true)).toBe(false)

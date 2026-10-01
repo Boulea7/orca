@@ -93,6 +93,14 @@ describe('serve update handoff', () => {
   })
 
   it.each([
+    'orca:serve-user-quit',
+    { type: ['orca:serve-user-quit'] },
+    { type: 'orca:serve-user-quit', runtimeId: 'unexpected' }
+  ])('rejects malformed user quit messages', (message) => {
+    expect(parseServeSupervisorMessage(message)).toBeNull()
+  })
+
+  it.each([
     { websocket: ['ready'], runtime: 'ready', graph: 'ready' },
     { websocket: 'ready', runtime: ['ready'], graph: 'ready' },
     { websocket: 'ready', runtime: 'ready', graph: ['ready'] }

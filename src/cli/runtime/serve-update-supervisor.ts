@@ -119,6 +119,9 @@ export async function superviseForegroundServe(
         }
       )
 
+      if (result.userQuitRequested) {
+        return SERVE_SUPERVISOR_STOP_EXIT_CODE
+      }
       if (expectedHandoff && result.readiness === 'failed') {
         return 1
       }

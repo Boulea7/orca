@@ -30,6 +30,7 @@ export type ServeChildExit = {
   signal: NodeJS.Signals | null
   readiness: ServeReadiness
   terminationRequested: boolean
+  userQuitRequested: boolean
   healthFailureReason: string | null
   healthyDurationMs: number
 }
@@ -46,6 +47,7 @@ export function waitForForegroundServeChild(
     let readiness: ServeReadiness = expected || options.healthProbe ? 'pending' : 'not-expected'
     let stateWrite = Promise.resolve()
     let terminationRequested = false
+    let userQuitRequested = false
     let healthFailureReason: string | null = null
     let healthySince: number | null = null
     let healthProbeInFlight = false
@@ -57,7 +59,7 @@ export function waitForForegroundServeChild(
       forceKillTimer ??= setTimeout(() => child.kill('SIGKILL'), SERVE_SUPERVISED_SHUTDOWN_GRACE_MS)
     }
     const recordReadinessFailure = (reason: string): boolean => {
-      if (readiness !== 'pending') {
+      if (readiness !== 'pending' || userQuitRequested) {
         return false
       }
       readiness = 'failed'
@@ -87,7 +89,7 @@ export function waitForForegroundServeChild(
       forceKillTimer ??= setTimeout(() => child.kill('SIGKILL'), SERVE_SUPERVISED_SHUTDOWN_GRACE_MS)
     }
     const scheduleHealthCheck = (runtimeId: string): void => {
-      if (!options.healthProbe || settled || readiness !== 'verified') {
+      if (!options.healthProbe || settled || userQuitRequested || readiness !== 'verified') {
         return
       }
       healthTimer = setTimeout(() => {
@@ -117,7 +119,7 @@ export function waitForForegroundServeChild(
       })
     const runHealthCheck = async (runtimeId: string): Promise<void> => {
       const health = await probeHealthWithDeadline()
-      if (settled || readiness !== 'verified') {
+      if (settled || userQuitRequested || readiness !== 'verified') {
         return
       }
       if (health.healthy && health.runtimeId === runtimeId) {
@@ -152,7 +154,7 @@ export function waitForForegroundServeChild(
     const verifyReadyMessage = async (runtimeId: string): Promise<void> => {
       // The readiness timer bounds this probe, and the pending guard ignores late completion.
       const health = options.healthProbe ? await options.healthProbe() : null
-      if (settled || readiness !== 'pending') {
+      if (settled || userQuitRequested || readiness !== 'pending') {
         return
       }
       if (health && (!health.healthy || health.runtimeId !== runtimeId)) {
@@ -185,7 +187,22 @@ export function waitForForegroundServeChild(
     }
     const handleMessage = (value: unknown): void => {
       const message = parseServeSupervisorMessage(value)
-      if (!message || readiness !== 'pending') {
+      if (!message) {
+        return
+      }
+      if (message.type === 'orca:serve-user-quit') {
+        userQuitRequested = true
+        if (readyTimer) {
+          clearTimeout(readyTimer)
+          readyTimer = null
+        }
+        if (healthTimer) {
+          clearTimeout(healthTimer)
+          healthTimer = null
+        }
+        return
+      }
+      if (userQuitRequested || readiness !== 'pending') {
         return
       }
       if (expected && message.version !== expected.targetVersion) {
@@ -241,6 +258,7 @@ export function waitForForegroundServeChild(
           signal,
           readiness,
           terminationRequested,
+          userQuitRequested,
           healthFailureReason,
           healthyDurationMs: healthySince === null ? 0 : Math.max(0, Date.now() - healthySince)
         })

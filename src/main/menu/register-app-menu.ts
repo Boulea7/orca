@@ -24,6 +24,7 @@ export function getNextDefaultOnAppearanceSettingValue(current: boolean | undefi
 }
 
 type RegisterAppMenuOptions = {
+  onQuit?: () => void
   onOpenSettings: () => void
   onOpenSetupGuide: (window?: Electron.BaseWindow | null) => void
   onOpenFeatureTour: (window?: Electron.BaseWindow | null) => void
@@ -163,7 +164,12 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
     submenu: [
       settingsItem,
       { type: 'separator' },
-      { role: 'quit', label: translateMain('menu.exit', 'Exit') }
+      {
+        label: translateMain('menu.exit', 'Exit'),
+        ...(options.onQuit ? { click: options.onQuit } : { role: 'quit' as const }),
+        accelerator:
+          options.onQuit && process.platform === 'linux' ? 'CommandOrControl+Q' : undefined
+      }
     ]
   }
 

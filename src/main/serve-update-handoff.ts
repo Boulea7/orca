@@ -34,6 +34,51 @@ export function hasForegroundServeSupervisor(): boolean {
   return process.env[SERVE_SUPERVISOR_ENV] === '1'
 }
 
+let pendingUserQuit = false
+
+export function markServeUserQuit(): void {
+  pendingUserQuit = true
+}
+
+export function cancelServeUserQuit(): void {
+  pendingUserQuit = false
+}
+
+export function notifyServeSupervisorUserQuit(
+  isServeMode: boolean,
+  updateQuitInProgress: boolean
+): Promise<void> {
+  const userQuit = pendingUserQuit
+  pendingUserQuit = false
+  const send = process.send
+  if (
+    !userQuit ||
+    !isServeMode ||
+    updateQuitInProgress ||
+    !hasForegroundServeSupervisor() ||
+    !send ||
+    process.connected !== true
+  ) {
+    return Promise.resolve()
+  }
+  return new Promise<void>((resolveNotification, reject) => {
+    try {
+      send.call(process, { type: 'orca:serve-user-quit' }, (error: Error | null) => {
+        if (error) {
+          reject(error)
+        } else {
+          resolveNotification()
+        }
+      })
+    } catch (error) {
+      reject(error)
+    }
+  }).catch((error: unknown) => {
+    console.warn('[serve] Could not notify supervisor of user quit:', error)
+    throw error
+  })
+}
+
 export function requestServeUpdateHandoff(targetVersion: string): boolean {
   const handoffPath = getConfiguredHandoffPath()
   if (!handoffPath || !targetVersion) {
