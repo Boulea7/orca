@@ -15,6 +15,10 @@ export type SingletonQuarantineResult =
   | { state: 'failed'; errorCode?: string }
 
 type MovedArtifact = { source: string; target: string; name: string }
+type RecoveryGuardFailure = Extract<
+  SingletonQuarantineResult,
+  { state: 'owner_changed' | 'failed' }
+>
 
 const STALE_QUARANTINE_SUFFIX = /^stale-\d+-(\d+)$/
 
@@ -133,6 +137,8 @@ export async function quarantineSingletonArtifacts(
   }
 
   const moved: MovedArtifact[] = [lock]
+  let result: SingletonQuarantineResult
+  let guardReleaseFailure: RecoveryGuardFailure | null
   try {
     for (const name of SINGLETON_ARTIFACT_NAMES) {
       if (name === 'SingletonLock') {
@@ -147,7 +153,7 @@ export async function quarantineSingletonArtifacts(
       moved.push({ source, target, name })
     }
     const movedNames = new Set(moved.map(({ name }) => name))
-    return {
+    result = {
       state: 'quarantined',
       paths: SINGLETON_ARTIFACT_NAMES.filter((name) => movedNames.has(name)).map(
         (name) => `${name}.${suffix}`
@@ -158,11 +164,34 @@ export async function quarantineSingletonArtifacts(
       await rename(entry.target, entry.source).catch(() => undefined)
     }
     await restoreExpectedLock(lock, expectedLockTarget, recoveryGuardTarget)
-    return quarantineFailure(error)
+    result = quarantineFailure(error)
   } finally {
-    if ((await readlink(lock.source).catch(() => null)) === recoveryGuardTarget) {
-      await unlink(lock.source).catch(() => undefined)
+    guardReleaseFailure = await releaseRecoveryGuard(lock.source, recoveryGuardTarget)
+  }
+  if (result.state === 'failed') {
+    if (guardReleaseFailure?.state === 'failed') {
+      process.stderr.write(
+        `[serve] could not release singleton recovery guard (${guardReleaseFailure.errorCode ?? 'unknown'}).\n`
+      )
     }
+    return result
+  }
+  return guardReleaseFailure ?? result
+}
+
+async function releaseRecoveryGuard(
+  path: string,
+  expectedTarget: string
+): Promise<RecoveryGuardFailure | null> {
+  try {
+    const target = await readlink(path)
+    if (target !== expectedTarget) {
+      return { state: 'owner_changed' }
+    }
+    await unlink(path)
+    return null
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? null : quarantineFailure(error)
   }
 }
 

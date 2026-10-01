@@ -189,7 +189,7 @@ export async function superviseForegroundServe(
               ? 'active_owner'
               : `${recovery.reason}${recovery.errorCode ? `:${recovery.errorCode}` : ''}`
           process.stderr.write(
-            `[serve] singleton recovery refused (${reason}); leaving the profile unchanged.\n`
+            `[serve] singleton recovery refused (${reason}); stopping without a replacement.\n`
           )
           return SERVE_ALREADY_RUNNING_EXIT_CODE
         }
