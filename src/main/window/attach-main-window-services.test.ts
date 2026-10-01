@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Store } from '../persistence'
+import type { RuntimeNotifier } from '../runtime/runtime-notifier-contract'
 
 const {
   onMock,
@@ -13,9 +14,12 @@ const {
   systemPreferencesGetMediaAccessStatusMock,
   registerRepoHandlersMock,
   setRepoRemoteClientNotifierMock,
+  setWorktreeCatalogRemoteClientNotifierMock,
   registerWorktreeHandlersMock,
   registerPtyHandlersMock,
   hydrateLocalPtyRegistryAtBootMock,
+  setWorktreeBaseDirectoryWatcherSyncContextMock,
+  scheduleWorktreeBaseDirectoryWatcherSyncMock,
   setupAutoUpdaterMock,
   browserManagerUnregisterAllMock,
   runWorktreeChangeInvalidatorsMock,
@@ -35,9 +39,12 @@ const {
   systemPreferencesGetMediaAccessStatusMock: vi.fn(),
   registerRepoHandlersMock: vi.fn(),
   setRepoRemoteClientNotifierMock: vi.fn(),
+  setWorktreeCatalogRemoteClientNotifierMock: vi.fn(),
   registerWorktreeHandlersMock: vi.fn(),
   registerPtyHandlersMock: vi.fn(),
   hydrateLocalPtyRegistryAtBootMock: vi.fn(),
+  setWorktreeBaseDirectoryWatcherSyncContextMock: vi.fn(),
+  scheduleWorktreeBaseDirectoryWatcherSyncMock: vi.fn(),
   setupAutoUpdaterMock: vi.fn(),
   browserManagerUnregisterAllMock: vi.fn(),
   runWorktreeChangeInvalidatorsMock: vi.fn(),
@@ -68,8 +75,15 @@ vi.mock('electron', () => ({
 }))
 
 vi.mock('../ipc/repos', () => ({
-  registerRepoHandlers: registerRepoHandlersMock,
+  registerRepoHandlers: registerRepoHandlersMock
+}))
+
+vi.mock('../ipc/repos/repos-changed-notification', () => ({
   setRepoRemoteClientNotifier: setRepoRemoteClientNotifierMock
+}))
+
+vi.mock('../ipc/watched-worktree-catalog-notification', () => ({
+  setWorktreeCatalogRemoteClientNotifier: setWorktreeCatalogRemoteClientNotifierMock
 }))
 
 vi.mock('../ipc/worktrees', () => ({
@@ -87,6 +101,11 @@ vi.mock('../ipc/pty', () => ({
 
 vi.mock('../memory/hydrate-local-pty-registry', () => ({
   hydrateLocalPtyRegistryAtBoot: hydrateLocalPtyRegistryAtBootMock
+}))
+
+vi.mock('../ipc/worktree-base-directory-watcher', () => ({
+  setWorktreeBaseDirectoryWatcherSyncContext: setWorktreeBaseDirectoryWatcherSyncContextMock,
+  scheduleWorktreeBaseDirectoryWatcherSync: scheduleWorktreeBaseDirectoryWatcherSyncMock
 }))
 
 vi.mock('../browser/browser-manager', () => ({
@@ -121,6 +140,7 @@ type MainWindowStub = {
   once: MockFn
   webContents: {
     id?: number
+    getURL: MockFn
     isDestroyed?: MockFn
     isLoadingMainFrame: MockFn
     on: MockFn
@@ -135,8 +155,10 @@ type MainWindowStub = {
 
 type RuntimeStub = {
   attachWindow: MockFn
-  setNotifier: MockFn
+  setNotifier: ReturnType<typeof vi.fn<(notifier: RuntimeNotifier | null) => void>>
   markRendererReloading: MockFn
+  markRendererReloadCancelled: MockFn
+  markGraphReloadFailed: MockFn
   markGraphUnavailable: MockFn
 }
 
@@ -150,6 +172,7 @@ function createMainWindow(
     once: vi.fn(),
     webContents: {
       id: 1,
+      getURL: vi.fn(() => 'file:///opt/orca/renderer/index.html'),
       isDestroyed: vi.fn(() => false),
       isLoadingMainFrame: vi.fn(() => true),
       on: vi.fn(),
@@ -165,15 +188,18 @@ function createMainWindow(
 
 function createStore(): Store & { flushPendingAsync: MockFn } {
   return {
+    getProfileStorageDirectory: vi.fn(() => '/profile-a'),
     flushPendingAsync: vi.fn(() => Promise.resolve())
-  } as Store & { flushPendingAsync: MockFn }
+  } as unknown as Store & { flushPendingAsync: MockFn }
 }
 
 function createRuntime(): RuntimeStub {
   return {
     attachWindow: vi.fn(),
-    setNotifier: vi.fn(),
+    setNotifier: vi.fn<(notifier: RuntimeNotifier | null) => void>(),
     markRendererReloading: vi.fn(),
+    markRendererReloadCancelled: vi.fn(),
+    markGraphReloadFailed: vi.fn(),
     markGraphUnavailable: vi.fn()
   }
 }
@@ -206,37 +232,18 @@ async function fireReadyToShow(mainWindow: MainWindowStub): Promise<void> {
 
 describe('attachMainWindowServices', () => {
   beforeEach(() => {
-    onMock.mockReset()
-    removeAllListenersMock.mockReset()
-    removeListenerMock.mockReset()
-    handleMock.mockReset()
-    removeHandlerMock.mockReset()
-    setPermissionRequestHandlerMock.mockReset()
-    setPermissionCheckHandlerMock.mockReset()
-    systemPreferencesAskForMediaAccessMock.mockReset()
-    systemPreferencesGetMediaAccessStatusMock.mockReset()
-    registerRepoHandlersMock.mockReset()
-    setRepoRemoteClientNotifierMock.mockReset()
-    registerWorktreeHandlersMock.mockReset()
-    registerPtyHandlersMock.mockReset()
-    hydrateLocalPtyRegistryAtBootMock.mockReset()
-    setupAutoUpdaterMock.mockReset()
-    browserManagerUnregisterAllMock.mockReset()
-    acknowledgePendingTccPromptNoticeMock.mockReset()
-    consumePendingTccPromptNoticeMock.mockReset()
-    dismissTccPromptNoticeMock.mockReset()
-    releasePendingTccPromptNoticeMock.mockReset()
+    vi.resetAllMocks()
     systemPreferencesAskForMediaAccessMock.mockResolvedValue(true)
     systemPreferencesGetMediaAccessStatusMock.mockReturnValue('granted')
   })
 
-  // #11994: without this wiring, host-local repo IPC mutations never reach paired clients.
-  it('gives the repo IPC handlers the runtime so repo changes reach paired clients', () => {
+  it('gives host-local catalog notifiers the runtime', () => {
     const runtime = createRuntime()
 
     attachMainWindowServices(createMainWindow() as never, createStore(), runtime as never)
 
     expect(setRepoRemoteClientNotifierMock).toHaveBeenCalledWith(runtime)
+    expect(setWorktreeCatalogRemoteClientNotifierMock).toHaveBeenCalledWith(runtime)
   })
 
   it('reloads the app renderer through main and marks expected renderer teardown', async () => {
@@ -265,8 +272,8 @@ describe('attachMainWindowServices', () => {
     expect(mainWindow.webContents.reload).toHaveBeenCalledTimes(1)
   })
 
-  it('retries local PTY registry hydration after local startup services are ready', async () => {
-    const localStartup = deferred()
+  it('hydrates once after the local PTY provider barrier resolves', async () => {
+    const providerStartup = deferred()
     const store = createStore()
 
     attachMainWindowServices(
@@ -275,18 +282,16 @@ describe('attachMainWindowServices', () => {
       createRuntime() as never,
       undefined,
       undefined,
-      { awaitLocalPtyStartup: () => localStartup.promise }
+      { awaitLocalPtyProviderStartup: () => providerStartup.promise }
     )
 
-    expect(hydrateLocalPtyRegistryAtBootMock).toHaveBeenCalledTimes(1)
-    expect(hydrateLocalPtyRegistryAtBootMock).toHaveBeenCalledWith(store)
+    expect(hydrateLocalPtyRegistryAtBootMock).not.toHaveBeenCalled()
 
-    localStartup.resolve()
-    await localStartup.promise
+    providerStartup.resolve()
+    await providerStartup.promise
     await Promise.resolve()
 
-    expect(hydrateLocalPtyRegistryAtBootMock).toHaveBeenCalledTimes(2)
-    expect(hydrateLocalPtyRegistryAtBootMock).toHaveBeenLastCalledWith(store)
+    expect(hydrateLocalPtyRegistryAtBootMock).toHaveBeenCalledExactlyOnceWith(store)
   })
 
   it('passes injected update quit cleanup to the auto-updater', async () => {
@@ -300,17 +305,23 @@ describe('attachMainWindowServices', () => {
       createRuntime() as never,
       undefined,
       undefined,
-      { onBeforeUpdateQuit, updateInstallMode: 'supervised-headless-serve' }
+      {
+        onBeforeUpdateQuit,
+        onBeforeUpdateQuitFailure: 'abort',
+        updateInstallMode: 'supervised-headless-serve'
+      }
     )
 
     // Deferred to first paint — must not be configured at attach time.
     expect(setupAutoUpdaterMock).not.toHaveBeenCalled()
     await fireReadyToShow(mainWindow)
     expect(setupAutoUpdaterMock).toHaveBeenCalledTimes(1)
-    expect(setupAutoUpdaterMock).toHaveBeenCalledWith(
-      mainWindow,
-      expect.objectContaining({ installMode: 'supervised-headless-serve' })
-    )
+    const [updaterWindow, updaterOptions] = setupAutoUpdaterMock.mock.calls[0]
+    expect(updaterWindow).toBe(mainWindow)
+    expect(updaterOptions).toMatchObject({
+      installMode: 'supervised-headless-serve',
+      onBeforeQuitFailure: 'abort'
+    })
     await setupAutoUpdaterMock.mock.calls[0][1].onBeforeQuit()
 
     expect(onBeforeUpdateQuit).toHaveBeenCalledTimes(1)
@@ -753,14 +764,9 @@ describe('attachMainWindowServices', () => {
     attachMainWindowServices(mainWindow as never, createStore(), runtime as never)
 
     expect(runtime.setNotifier).toHaveBeenCalledTimes(1)
-    const notifier = runtime.setNotifier.mock.calls[0][0] as {
-      worktreesChanged: (repoId: string) => void
-      reposChanged: () => void
-      activateWorktree: (
-        repoId: string,
-        worktreeId: string,
-        setup?: { runnerScriptPath: string; envVars: Record<string, string> }
-      ) => void
+    const notifier = runtime.setNotifier.mock.calls[0][0]
+    if (!notifier) {
+      throw new Error('Missing runtime notifier')
     }
 
     notifier.worktreesChanged('repo-1')
@@ -795,6 +801,21 @@ describe('attachMainWindowServices', () => {
     expect(runWorktreeChangeInvalidatorsMock.mock.invocationCallOrder[0]).toBeLessThan(
       sendMock.mock.invocationCallOrder[0]
     )
+  })
+
+  it('marks renderer process loss as a graph reload failure', () => {
+    const mainWindow = createMainWindow()
+    const runtime = createRuntime()
+    attachMainWindowServices(mainWindow as never, createStore(), runtime as never)
+
+    const handlers = mainWindow.webContents.on.mock.calls
+      .filter(([event]) => event === 'render-process-gone')
+      .map(([, handler]) => handler as () => void)
+    for (const handler of handlers) {
+      handler()
+    }
+
+    expect(runtime.markGraphReloadFailed).toHaveBeenCalledWith(1, 'renderer-process-gone')
   })
 
   it('accepts terminal reveal replies only from the main window renderer', async () => {
@@ -912,5 +933,22 @@ describe('attachMainWindowServices', () => {
       title: undefined,
       identity
     })
+  })
+
+  it('keeps deferred worktree watcher setup inside the service boundary', async () => {
+    const mainWindow = createMainWindow()
+    const store = createStore()
+
+    vi.useFakeTimers()
+    try {
+      attachMainWindowServices(mainWindow as never, store, createRuntime() as never)
+
+      expect(setWorktreeBaseDirectoryWatcherSyncContextMock).toHaveBeenCalledWith(store, mainWindow)
+      expect(scheduleWorktreeBaseDirectoryWatcherSyncMock).toHaveBeenCalledWith(store, mainWindow)
+
+      await vi.advanceTimersByTimeAsync(100)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

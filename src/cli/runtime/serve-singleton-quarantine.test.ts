@@ -1,11 +1,47 @@
-import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import type * as Filesystem from 'node:fs/promises'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   removeAbandonedServeSingletonQuarantines,
   SINGLETON_ARTIFACT_NAMES
 } from './serve-singleton-quarantine'
+import { prepareLinuxServeSupervision } from './serve-linux-supervision-startup'
+
+const cleanupFault = vi.hoisted(() => ({
+  path: '',
+  remaining: 0,
+  readlinkPath: '',
+  markerFlight: null as Promise<void> | null
+}))
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const filesystem = await importOriginal<typeof Filesystem>()
+  return {
+    ...filesystem,
+    readlink: (...args: Parameters<typeof filesystem.readlink>) => {
+      if (String(args[0]) === cleanupFault.readlinkPath) {
+        return Promise.reject(
+          Object.assign(new Error('canonical target unreadable'), { code: 'EACCES' })
+        )
+      }
+      return filesystem.readlink(...args)
+    },
+    unlink: (...args: Parameters<typeof filesystem.unlink>) => {
+      if (String(args[0]) === cleanupFault.path && cleanupFault.remaining > 0) {
+        cleanupFault.remaining -= 1
+        return Promise.reject(
+          Object.assign(new Error('artifact cleanup failed'), { code: 'EPERM' })
+        )
+      }
+      const result = filesystem.unlink(...args)
+      if (String(args[0]).includes('SingletonRecoveryCommit.')) {
+        cleanupFault.markerFlight = result
+      }
+      return result
+    }
+  }
+})
 
 async function pathExists(path: string): Promise<boolean> {
   return lstat(path).then(
@@ -18,6 +54,10 @@ describe.skipIf(process.platform === 'win32')('serve singleton quarantine cleanu
   const roots: string[] = []
 
   afterEach(async () => {
+    cleanupFault.path = ''
+    cleanupFault.remaining = 0
+    cleanupFault.readlinkPath = ''
+    cleanupFault.markerFlight = null
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
   })
 
@@ -41,6 +81,8 @@ describe.skipIf(process.platform === 'win32')('serve singleton quarantine cleanu
       await symlink(`live-${name}`, join(userDataPath, `${name}.${liveSuffix}`))
     }
     await symlink('unrelated', join(userDataPath, 'SingletonLock.stale-invalid'))
+    await writeFile(join(userDataPath, `SingletonRecoveryCommit.${deadSuffix}`), '')
+    await writeFile(join(userDataPath, `SingletonRecoveryCommit.${liveSuffix}`), '')
 
     await removeAbandonedServeSingletonQuarantines(
       userDataPath,
@@ -54,6 +96,106 @@ describe.skipIf(process.platform === 'win32')('serve singleton quarantine cleanu
     }
     expect(await pathExists(scopedDirectory)).toBe(false)
     expect(await pathExists(join(userDataPath, 'SingletonLock.stale-invalid'))).toBe(true)
+    expect(await pathExists(join(userDataPath, `SingletonRecoveryCommit.${deadSuffix}`))).toBe(
+      false
+    )
+  })
+
+  it('retains the commit marker after failed cleanup so a later startup can retry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'orca-quarantine-retry-'))
+    roots.push(root)
+    const suffix = 'stale-1000-2147483647'
+    const marker = join(root, `SingletonRecoveryCommit.${suffix}`)
+    const artifact = join(root, `SingletonLock.${suffix}`)
+    await symlink('dead-owner', artifact)
+    await writeFile(marker, '')
+    cleanupFault.path = artifact
+    cleanupFault.remaining = 1
+
+    await expect(prepareLinuxServeSupervision(root, root, {})).rejects.toMatchObject({
+      code: 'EPERM'
+    })
+    await cleanupFault.markerFlight
+    expect(await pathExists(marker)).toBe(true)
+    expect(await pathExists(artifact)).toBe(true)
+    const childEnv: NodeJS.ProcessEnv = {}
+    await expect(prepareLinuxServeSupervision(root, root, childEnv)).resolves.toBeUndefined()
+    expect(childEnv.ORCA_SERVE_SUPERVISED).toBe('1')
+    expect(await pathExists(artifact)).toBe(false)
+    expect(await pathExists(marker)).toBe(false)
+  })
+
+  it.each(['missing', 'changed', 'unreadable', 'recoverer-alive'])(
+    'preserves unconfirmed ownership evidence when canonical state is %s',
+    async (state) => {
+      const root = await mkdtemp(join(tmpdir(), 'orca-quarantine-pending-'))
+      roots.push(root)
+      const pid = state === 'recoverer-alive' ? process.pid : 2147483647
+      const backup = join(root, `SingletonLock.stale-1000-${pid}`)
+      const canonical = join(root, 'SingletonLock')
+      await symlink('original-owner', backup)
+      if (state !== 'missing') {
+        await symlink(state === 'changed' ? 'foreign-owner' : 'original-owner', canonical)
+      }
+      if (state === 'unreadable') {
+        cleanupFault.readlinkPath = canonical
+      }
+      const childEnv: NodeJS.ProcessEnv = {}
+
+      await expect(prepareLinuxServeSupervision(root, root, childEnv)).rejects.toThrow(
+        'Unconfirmed singleton backup'
+      )
+      expect(await pathExists(backup)).toBe(true)
+      expect(await pathExists(canonical)).toBe(state !== 'missing')
+      expect(childEnv.ORCA_SERVE_SUPERVISED).toBeUndefined()
+    }
+  )
+
+  it('removes restored socket duplicates without removing their live scoped directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'orca-quarantine-restored-'))
+    roots.push(root)
+    const scopedDirectory = join(root, 'scoped_dirABC123')
+    await mkdir(scopedDirectory)
+    const socketTarget = join(scopedDirectory, 'SingletonSocket')
+    await writeFile(socketTarget, 'live socket')
+    await symlink('live-cookie', join(scopedDirectory, 'SingletonCookie'))
+    const backup = join(root, 'SingletonSocket.stale-1000-2147483647')
+    await symlink(socketTarget, join(root, 'SingletonSocket'))
+    await symlink(socketTarget, backup)
+
+    await expect(prepareLinuxServeSupervision(root, root, {})).resolves.toBeUndefined()
+    expect(await pathExists(backup)).toBe(false)
+    expect(await pathExists(socketTarget)).toBe(true)
+    expect(await pathExists(join(scopedDirectory, 'SingletonCookie'))).toBe(true)
+  })
+
+  it('preserves the whole unconfirmed batch when only an earlier artifact matches', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'orca-quarantine-mixed-'))
+    roots.push(root)
+    const suffix = 'stale-1000-2147483647'
+    await symlink('same-socket', join(root, 'SingletonSocket'))
+    await symlink('same-socket', join(root, `SingletonSocket.${suffix}`))
+    await symlink('foreign-owner', join(root, 'SingletonLock'))
+    await symlink('original-owner', join(root, `SingletonLock.${suffix}`))
+
+    await expect(prepareLinuxServeSupervision(root, root, {})).rejects.toThrow(
+      'Unconfirmed singleton backup'
+    )
+    expect(await pathExists(join(root, `SingletonSocket.${suffix}`))).toBe(true)
+    expect(await pathExists(join(root, `SingletonLock.${suffix}`))).toBe(true)
+  })
+
+  it('removes only a hardlinked backup of a restored companion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'orca-quarantine-hardlink-'))
+    roots.push(root)
+    const source = join(root, 'SingletonCookie')
+    const backup = join(root, 'SingletonCookie.stale-1000-2147483647')
+    await writeFile(backup, 'live-cookie')
+    await link(backup, source)
+
+    await expect(prepareLinuxServeSupervision(root, root, {})).resolves.toBeUndefined()
+    expect(await pathExists(source)).toBe(true)
+    expect(await pathExists(backup)).toBe(false)
   })
 
   it('treats a missing profile as already reconciled', async () => {

@@ -5,9 +5,10 @@ import {
   type KeybindingActionId,
   type KeybindingOverrides
 } from '../../shared/keybindings'
-import type { UpdateCheckOptions } from '../../shared/types'
+import type { UpdateCheckOptions } from '../../shared/update-status-types'
 import { translateMain } from '../i18n/main-i18n'
 import { createAppMenuSelectionItem } from './app-menu-selection-item'
+import { createAppMenuQuitItem } from './app-menu-quit-item'
 
 export type AppearanceMenuState = {
   showTasksButton: boolean
@@ -114,8 +115,16 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
     click: checkForUpdatesClick
   }
 
+  const settingsBindings = getEffectiveKeybindingsForAction(
+    'app.settings',
+    process.platform,
+    getKeybindings?.()
+  )
+  const settingsShortcut = settingsBindings.length
+    ? `\t${formatKeybindingList(settingsBindings, process.platform)}`
+    : ''
   const settingsItem: Electron.MenuItemConstructorOptions = {
-    label: `${translateMain('menu.settings', 'Settings')}\t${shortcutLabel('app.settings')}`,
+    label: `${translateMain('menu.settings', 'Settings')}${settingsShortcut}`,
     click: () => onOpenSettings()
   }
 
@@ -152,7 +161,7 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
       { role: 'hideOthers' },
       { role: 'unhide' },
       { type: 'separator' },
-      { role: 'quit' }
+      createAppMenuQuitItem(options.onQuit)
     ]
   }
 
@@ -161,16 +170,7 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
     // Why: on Windows/Linux there is no app-named menu, so Settings and
     // Quit live under File — matching the common platform convention and
     // keeping all user-facing actions reachable from the in-window menu bar.
-    submenu: [
-      settingsItem,
-      { type: 'separator' },
-      {
-        label: translateMain('menu.exit', 'Exit'),
-        ...(options.onQuit ? { click: options.onQuit } : { role: 'quit' as const }),
-        accelerator:
-          options.onQuit && process.platform === 'linux' ? 'CommandOrControl+Q' : undefined
-      }
-    ]
+    submenu: [settingsItem, { type: 'separator' }, createAppMenuQuitItem(options.onQuit)]
   }
 
   // Why: keep native menu hints while letting non-macOS Ctrl+Z/Ctrl+Y reach the focused terminal or DOM control.

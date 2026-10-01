@@ -1,9 +1,6 @@
-import type {
-  GlobalSettings,
-  PersistedUIState,
-  WorktreeCardMode,
-  WorktreeCardProperty
-} from '../types'
+import type { GlobalSettings } from '../global-settings-types'
+import type { PersistedUIState } from '../persisted-ui-state-types'
+import type { WorktreeCardMode, WorktreeCardProperty } from '../ui-chrome-types'
 
 const FIXED_WORKTREE_CARD_PROPERTIES: WorktreeCardProperty[] = ['status', 'unread']
 
@@ -24,7 +21,8 @@ export const DEFAULT_WORKTREE_CARD_PROPERTIES: WorktreeCardProperty[] = [
   // Why: agent activity is the primary reason users opt into the feature, so
   // the Default mode keeps it inline on each card while Compact removes the
   // extra row.
-  'inline-agents'
+  'inline-agents',
+  'host'
 ]
 
 // Why: compact cards default to the quiet preset; metadata icons remain opt-in
@@ -58,7 +56,8 @@ export const WORKTREE_CARD_PROPERTIES = [
   'cli',
   'comment',
   'ports',
-  'inline-agents'
+  'inline-agents',
+  'host'
 ] as const satisfies readonly WorktreeCardProperty[]
 
 export function normalizeWorktreeCardProperties(

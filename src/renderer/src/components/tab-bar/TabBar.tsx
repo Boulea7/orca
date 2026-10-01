@@ -7,6 +7,7 @@ import { useTabBarRuntimeModel } from './use-tab-bar-runtime-model'
 import { useTabBarCreateMenuController } from './use-tab-bar-create-menu-controller'
 import { useTabBarItemProjection } from './use-tab-bar-item-projection'
 import { renderTabBarSurface } from './tab-bar-surface'
+import { useActiveClientHostedBrowserRowId } from '@/lib/pane-manager/client-hosted-browser-row-state'
 
 function TabBarInner(props: TabBarProps): React.JSX.Element {
   const {
@@ -63,10 +64,19 @@ function TabBarInner(props: TabBarProps): React.JSX.Element {
     }
     runtime.pinTab(item.unifiedTabId)
   }
+  // Read here, not just where the rows render: the real tabs have to know when a row took over.
+  const activeClientHostedBrowserRowId = useActiveClientHostedBrowserRowId({
+    worktreeId,
+    groupId: runtime.resolvedGroupId,
+    groupActiveTabId: props.groupActiveTabId ?? null
+  })
   const tabStripNavigation = useTabStripOverflowNavigation({
     activeVisibleTabId: itemProjection.activeVisibleTabId,
-    layoutKey: itemProjection.tabStripLayoutKey,
-    tabCount: itemProjection.orderedItems.length,
+    activeDockSlotId: activeClientHostedBrowserRowId ?? itemProjection.activeVisibleTabId,
+    layoutKey: [
+      itemProjection.tabStripLayoutKey,
+      ...(props.clientHostedBrowserRows ?? []).map((row) => row.browserPageId)
+    ].join('|'),
     worktreeId
   })
   const tabStripDragScroll = useTabStripDragScrollHandlers(tabStripNavigation.scrollTabStrip, {
@@ -81,6 +91,7 @@ function TabBarInner(props: TabBarProps): React.JSX.Element {
     itemProjection,
     tabStripNavigation,
     tabStripDragScroll,
+    activeClientHostedBrowserRowId,
     togglePinned
   })
 }

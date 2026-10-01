@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { FolderWorkspace, ProjectGroup } from '../../../../shared/types'
+import type { FolderWorkspace } from '../../../../shared/folder-workspace-types'
+import type { ProjectGroup } from '../../../../shared/project-group-types'
 import { folderWorkspaceKey } from '../../../../shared/workspace-scope'
 import type * as NewWorkspaceModule from '@/lib/new-workspace'
 
@@ -27,7 +28,7 @@ vi.mock('@/lib/new-workspace', async (importOriginal) => {
 
 import { useAppStore } from '@/store'
 import { decideInitialAgentTabViewMode } from '@/lib/native-chat-initial-view-mode'
-import { resolveStartupLaunchDraftText } from '@/lib/worktree-activation'
+import { resolveStartupLaunchDraftText } from '@/lib/worktree-startup-payload'
 import {
   getFolderWorkspaceAgentLaunchPlatform,
   submitFolderWorkspaceCreate
@@ -70,19 +71,11 @@ function makeFolderWorkspace(overrides: Partial<FolderWorkspace> = {}): FolderWo
 describe('submitFolderWorkspaceCreate', () => {
   beforeEach(() => {
     mocks.activateAndRevealFolderWorkspace.mockReturnValue({ primaryTabId: 'tab-1' })
-    Object.assign(window, {
-      api: {
-        agentTrust: {
-          markTrusted: vi.fn().mockResolvedValue(undefined)
-        }
-      }
-    })
   })
 
   afterEach(() => {
     mocks.activateAndRevealFolderWorkspace.mockReset()
     mocks.ensureAgentStartupInTerminal.mockReset()
-    Reflect.deleteProperty(window, 'api')
     vi.restoreAllMocks()
   })
 
@@ -115,6 +108,7 @@ describe('submitFolderWorkspaceCreate', () => {
     })
     expect(onOpenChange).toHaveBeenCalledWith(false)
     expect(mocks.activateAndRevealFolderWorkspace).toHaveBeenCalledWith('folder-workspace-1', {
+      agent: null,
       runtimeEnvironmentId: null
     })
     expect(consoleError).toHaveBeenCalledWith(
@@ -311,10 +305,6 @@ describe('submitFolderWorkspaceCreate', () => {
     expect(startup?.command).toBe('codex')
     expect(startup?.command).not.toContain(linkedWorkItem.url)
     expect(startup?.command).not.toContain('Review this before starting')
-    expect(window.api.agentTrust?.markTrusted).toHaveBeenCalledWith({
-      preset: 'codex',
-      workspacePath: '/repo/platform/hi'
-    })
     expect(mocks.ensureAgentStartupInTerminal).toHaveBeenCalledWith({
       worktreeId: folderWorkspaceKey('folder-workspace-1'),
       primaryTabId: 'tab-1',
@@ -327,7 +317,7 @@ describe('submitFolderWorkspaceCreate', () => {
     })
   })
 
-  it('pre-marks remote linked Codex folder workspaces trusted before draft paste', async () => {
+  it('pastes the linked draft for remote Codex folder workspaces', async () => {
     const createFolderWorkspace = vi.fn(async () =>
       makeFolderWorkspace({
         connectionId: 'ssh-1',
@@ -362,11 +352,6 @@ describe('submitFolderWorkspaceCreate', () => {
       onOpenChange: vi.fn()
     })
 
-    expect(window.api.agentTrust?.markTrusted).toHaveBeenCalledWith({
-      preset: 'codex',
-      workspacePath: '/home/alice/platform/Trust remote folder draft',
-      connectionId: 'ssh-1'
-    })
     expect(mocks.ensureAgentStartupInTerminal).toHaveBeenCalledWith(
       expect.objectContaining({
         worktreeId: folderWorkspaceKey('folder-workspace-1'),
@@ -531,6 +516,7 @@ describe('submitFolderWorkspaceCreate', () => {
       linkedTask: linkedWorkItem
     })
     expect(mocks.activateAndRevealFolderWorkspace).toHaveBeenCalledWith('folder-workspace-1', {
+      agent: null,
       runtimeEnvironmentId: null
     })
     expect(mocks.ensureAgentStartupInTerminal).not.toHaveBeenCalled()
@@ -587,7 +573,7 @@ describe('submitFolderWorkspaceCreate', () => {
       'folder-workspace-1',
       expect.objectContaining({
         startup: expect.objectContaining({
-          command: "claude 'Use Bob'\\''s POSIX startup'"
+          command: `claude 'Use Bob'"'"'s POSIX startup'`
         })
       })
     )
@@ -658,6 +644,7 @@ describe('submitFolderWorkspaceCreate', () => {
     })
     expect(onOpenChange).toHaveBeenCalledWith(false)
     expect(mocks.activateAndRevealFolderWorkspace).toHaveBeenCalledWith('folder-workspace-1', {
+      agent: null,
       runtimeEnvironmentId: null
     })
   })
@@ -704,16 +691,12 @@ describe('submitFolderWorkspaceCreate native-chat launch draft', () => {
   beforeEach(() => {
     mocks.activateAndRevealFolderWorkspace.mockReturnValue({ primaryTabId: 'tab-1' })
     useAppStore.setState({ nativeChatLaunchDraftByTabId: {} })
-    Object.assign(window, {
-      api: { agentTrust: { markTrusted: vi.fn().mockResolvedValue(undefined) } }
-    })
   })
 
   afterEach(() => {
     mocks.activateAndRevealFolderWorkspace.mockReset()
     mocks.ensureAgentStartupInTerminal.mockReset()
     useAppStore.setState({ nativeChatLaunchDraftByTabId: {} })
-    Reflect.deleteProperty(window, 'api')
     vi.restoreAllMocks()
   })
 
@@ -812,16 +795,12 @@ describe('folder-workspace draft: seeded set == chat-opening set', () => {
   beforeEach(() => {
     mocks.activateAndRevealFolderWorkspace.mockReturnValue({ primaryTabId: 'tab-1' })
     useAppStore.setState({ nativeChatLaunchDraftByTabId: {} })
-    Object.assign(window, {
-      api: { agentTrust: { markTrusted: vi.fn().mockResolvedValue(undefined) } }
-    })
   })
 
   afterEach(() => {
     mocks.activateAndRevealFolderWorkspace.mockReset()
     mocks.ensureAgentStartupInTerminal.mockReset()
     useAppStore.setState({ nativeChatLaunchDraftByTabId: {} })
-    Reflect.deleteProperty(window, 'api')
     vi.restoreAllMocks()
   })
 

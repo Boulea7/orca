@@ -13,6 +13,10 @@ import {
   readSavedCursorRegister,
   serializeWithAbsoluteCursor
 } from './terminal-serialize-absolute-cursor'
+import {
+  ABORT_TRUNCATED_CONTROL_STRING,
+  buildSnapshotReplayPrologue
+} from './terminal-mode-reset-profiles'
 
 export type ParityTerminal = {
   terminal: Terminal
@@ -170,11 +174,18 @@ export function normalBufferStylesTrimmed(terminal: Terminal): string[] {
   return rows
 }
 
-// Mirror of applyMainBufferSnapshot's clear preamble (pty-connection.ts):
-// normal-buffer restores wipe screen+scrollback+home; alt-screen restores
-// clear only the alt screen so the normal buffer's scrollback survives.
-export const SNAPSHOT_REPLAY_PREAMBLE_NORMAL = '\x1b[2J\x1b[3J\x1b[H'
-export const SNAPSHOT_REPLAY_PREAMBLE_ALT = '\x1b[0m\x1b[?1049h\x1b[2J\x1b[H'
+// Re-exported, never re-spelled: these had drifted from production twice
+// (they still carried the pre-#14241 preambles), which left the fuzz and
+// colour-parity harnesses asserting against bytes the restorer no longer
+// emits — precisely the failure this module's own header warns about (#12101).
+// The harnesses replay into a fresh terminal, which starts on the normal
+// buffer, so that is the pane state they ground from.
+export const SNAPSHOT_REPLAY_PREAMBLE_NORMAL = `${ABORT_TRUNCATED_CONTROL_STRING}${buildSnapshotReplayPrologue(
+  { targetAlternateScreen: false, paneOnAlternateScreen: false }
+)}`
+export const SNAPSHOT_REPLAY_PREAMBLE_ALT = `${ABORT_TRUNCATED_CONTROL_STRING}${buildSnapshotReplayPrologue(
+  { targetAlternateScreen: true, paneOnAlternateScreen: false }
+)}`
 
 export { POST_REPLAY_LIVE_SNAPSHOT_RESET as POST_REPLAY_LIVE_SNAPSHOT_RESET_PARITY } from './terminal-mode-reset-profiles'
 
@@ -244,8 +255,8 @@ export function buildParityMainBufferSnapshot(
   if (!alternateScreen && terminal.modes.applicationCursorKeysMode) {
     seqs.push('\x1b[?1h')
   }
-  // Mouse-mode rehydrate omitted: TerminalMouseModeMirror is main-only and
-  // mouse reporting is input encoding — it cannot alter rendered output.
+  // Mouse-mode rehydrate omitted: mouse reporting is input encoding — it
+  // cannot alter rendered output.
   const snapshot: ParityMainSnapshot = {
     data: seqs.join('') + snapshotAnsi,
     cols: terminal.cols,

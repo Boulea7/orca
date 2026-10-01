@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { join } from 'node:path'
+import { installFakeAppEnvironment } from '../../../config/scripts/vitest-host-ports-setup'
 import {
   CLIPBOARD_IMAGE_MAX_BASE64_CHARS,
   CLIPBOARD_IMAGE_MAX_PIXELS,
@@ -12,6 +13,7 @@ const {
   spawnMock,
   childStdinEndMock,
   resolveAuthorizedPathMock,
+  authorizeExternalPathMock,
   fsAccessMock,
   fsLstatMock,
   fsMkdirMock,
@@ -24,6 +26,7 @@ const {
   clipboardReadBufferMock,
   clipboardWriteTextMock,
   clipboardReadImageMock,
+  clipboardAvailableFormatsMock,
   clipboardWriteImageMock,
   clipboardWriteBufferMock,
   nativeImageCreateFromBufferMock,
@@ -47,6 +50,7 @@ const {
     return child
   }),
   resolveAuthorizedPathMock: vi.fn(),
+  authorizeExternalPathMock: vi.fn(),
   fsAccessMock: vi.fn(),
   fsLstatMock: vi.fn(),
   fsMkdirMock: vi.fn(),
@@ -59,6 +63,7 @@ const {
   clipboardReadBufferMock: vi.fn(),
   clipboardWriteTextMock: vi.fn(),
   clipboardReadImageMock: vi.fn(),
+  clipboardAvailableFormatsMock: vi.fn(),
   clipboardWriteImageMock: vi.fn(),
   clipboardWriteBufferMock: vi.fn(),
   nativeImageCreateFromBufferMock: vi.fn(),
@@ -79,6 +84,7 @@ vi.mock('node:fs/promises', () => ({
   rm: fsRmMock,
   open: fsOpenMock,
   stat: fsStatMock,
+  realpath: vi.fn(), // unused here; only satisfies filesystem-path-containment's named import
   writeFile: fsWriteFileMock,
   default: {
     writeFile: fsWriteFileMock
@@ -88,9 +94,8 @@ vi.mock('node:fs/promises', () => ({
 vi.mock('../ipc/filesystem-auth', () => ({
   PATH_ACCESS_DENIED_MESSAGE:
     'Access denied: path resolves outside allowed directories. If this blocks a legitimate workflow, please file a GitHub issue.',
-  isENOENT: (error: unknown): boolean =>
-    error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT',
-  resolveAuthorizedPath: resolveAuthorizedPathMock
+  resolveAuthorizedPath: resolveAuthorizedPathMock,
+  authorizeExternalPath: authorizeExternalPathMock
 }))
 
 vi.mock('node:crypto', () => ({
@@ -106,6 +111,7 @@ vi.mock('electron', () => ({
     readBuffer: clipboardReadBufferMock,
     writeText: clipboardWriteTextMock,
     readImage: clipboardReadImageMock,
+    availableFormats: clipboardAvailableFormatsMock,
     writeImage: clipboardWriteImageMock,
     writeBuffer: clipboardWriteBufferMock
   },
@@ -192,6 +198,7 @@ function shellIdListArray(childCount: number): Buffer {
 
 describe('registerClipboardHandlers', () => {
   beforeEach(() => {
+    installFakeAppEnvironment({ getPath: () => '/tmp' })
     vi.spyOn(Date, 'now').mockReturnValue(1760000000000)
     removeHandlerMock.mockReset()
     handleMock.mockReset()
@@ -547,30 +554,9 @@ describe('registerClipboardHandlers', () => {
     expect(removeHandlerMock).toHaveBeenCalledWith('clipboard:writeImage')
     expect(removeHandlerMock).toHaveBeenCalledWith('clipboard:writeFile')
     expect(removeHandlerMock).toHaveBeenCalledWith('clipboard:saveImageAsTempFile')
-  })
-
-  it('saves clipboard images to a local temp file when no connection is provided', async () => {
-    const png = Buffer.from([0, 1, 2, 3])
-    const expectedPath = join(
-      '/tmp',
-      'orca-paste-1760000000000-00000000-0000-4000-8000-000000000000.png'
-    )
-    clipboardReadImageMock.mockReturnValue({
-      getSize: () => ({ height: 1, width: 1 }),
-      isEmpty: () => false,
-      toPNG: () => png
-    })
-
-    registerClipboardHandlers({} as never)
-
-    const handlers = getRegisteredHandlers()
-    await expect(
-      handlers.get('clipboard:saveImageAsTempFile')?.(makeClipboardEvent(), undefined)
-    ).resolves.toBe(expectedPath)
-    expect(fsWriteFileMock).toHaveBeenCalledWith(expectedPath, png)
-    expect(clipboardReadBufferMock).not.toHaveBeenCalled()
-    expect(fsOpenMock).not.toHaveBeenCalled()
-    expect(getSshFilesystemProviderMock).not.toHaveBeenCalled()
+    expect(removeHandlerMock).toHaveBeenCalledWith('clipboard:readImageThumbnail')
+    expect(removeHandlerMock).toHaveBeenCalledWith('clipboard:hasImage')
+    expect(removeHandlerMock).toHaveBeenCalledWith('clipboard:readFilePaths')
   })
 
   it('does not inspect FileNameW when an empty image clipboard is read outside Windows', async () => {
@@ -892,5 +878,19 @@ describe('registerClipboardHandlers', () => {
 
     expect(nativeImageCreateFromBufferMock).toHaveBeenCalled()
     expect(clipboardWriteImageMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [['text/plain'], false],
+    [['text/plain', 'image/png'], true]
+  ])('reports image presence for %j from the format list without decoding', (formats, expected) => {
+    setTrustedClipboardRendererWebContentsId(17)
+    clipboardAvailableFormatsMock.mockReturnValue(formats)
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: registering handlers never reads the store for clipboard image presence.
+    registerClipboardHandlers({} as never)
+    const probe = getRegisteredHandlers().get('clipboard:hasImage')
+    expect(probe?.(makeClipboardEvent())).toBe(expected)
+    expect(clipboardReadImageMock).not.toHaveBeenCalled()
+    expect(() => probe?.(makeClipboardEvent({ id: 42 }))).toThrow()
   })
 })

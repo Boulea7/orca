@@ -62,6 +62,49 @@ function supervisorArgs(
 }
 
 describe('foreground serve crash supervisor', () => {
+  it('does not reset a spent restart budget using unhealthy shutdown time', async () => {
+    vi.useFakeTimers()
+    const first = new FakeChildProcess(4101)
+    const second = new FakeChildProcess(4102)
+    const third = new FakeChildProcess(4103)
+    let unreachable = false
+    const healthProbe = vi.fn(async () =>
+      unreachable
+        ? { healthy: false as const, reason: 'runtime_unreachable' as const }
+        : { healthy: true as const, runtimeId: 'runtime-ready' }
+    )
+    const args = supervisorArgs(first, {
+      healthProbe,
+      restartDelaysMs: [10],
+      healthCheckIntervalMs: 1_000,
+      healthFailureLimit: 1,
+      stableRunResetMs: 300_000
+    })
+    args.spawnChildMock.mockReturnValueOnce(second as never).mockReturnValue(third as never)
+    const result = superviseForegroundServe(args)
+    try {
+      first.emit('exit', 1, null)
+      await vi.advanceTimersByTimeAsync(0)
+      second.emit('message', readyMessage)
+      await vi.advanceTimersByTimeAsync(299_000)
+      unreachable = true
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(second.kill).toHaveBeenCalledWith('SIGTERM')
+      await vi.advanceTimersByTimeAsync(SERVE_SUPERVISED_SHUTDOWN_GRACE_MS)
+      second.emit('exit', null, 'SIGKILL')
+      await vi.advanceTimersByTimeAsync(0)
+      third.emit('exit', SERVE_SUPERVISOR_STOP_EXIT_CODE, null)
+      await expect(result).resolves.toBe(SERVE_SUPERVISOR_STOP_EXIT_CODE)
+      expect(args.spawnChildMock).toHaveBeenCalledOnce()
+      expect(args.sleep).toHaveBeenCalledOnce()
+    } finally {
+      first.emit('exit', SERVE_SUPERVISOR_STOP_EXIT_CODE, null)
+      second.emit('exit', SERVE_SUPERVISOR_STOP_EXIT_CODE, null)
+      third.emit('exit', SERVE_SUPERVISOR_STOP_EXIT_CODE, null)
+      vi.useRealTimers()
+    }
+  })
+
   it('outlives the child daemon-preservation fail-open before requiring readiness', async () => {
     vi.useFakeTimers()
     const child = new FakeChildProcess(4101)

@@ -65,11 +65,35 @@ export class PtyConsumerSession {
     hello: PtyConsumerSessionHello,
     authentication: PtyConsumerAuthentication
   ): PtyConsumerSessionAdmission {
+    return this.admitInternal(hello, authentication, false)
+  }
+
+  /** Migration recovery must not turn an absent historical owner into a fresh claim. */
+  admitResumed(
+    hello: PtyConsumerSessionHello,
+    authentication: PtyConsumerAuthentication
+  ): PtyConsumerSessionAdmission {
+    return this.admitInternal(hello, authentication, true)
+  }
+
+  private admitInternal(
+    hello: PtyConsumerSessionHello,
+    authentication: PtyConsumerAuthentication,
+    requireResume: boolean
+  ): PtyConsumerSessionAdmission {
     validateHello(hello)
     assertNonEmptyString(authentication.connectionId, 'connectionId')
     assertNonEmptyString(authentication.principal, 'principal')
     if (!authentication.authenticated) {
       throw new Error('PTY consumer authentication required')
+    }
+    if (
+      requireResume &&
+      (!hello.resume ||
+        hello.requestedRole !== 'session-owner' ||
+        !authentication.allowSessionOwner)
+    ) {
+      throw new Error('pty_consumer_resume_required')
     }
     this.expireOwner()
 
@@ -80,6 +104,13 @@ export class PtyConsumerSession {
       throw new Error('pty.openClient may be used only once per transport connection')
     }
 
+    if (requireResume) {
+      if (!this.owner) {
+        throw new Error('pty_consumer_resume_owner_missing')
+      }
+      // Refused recovery must not shorten an incumbent's disconnected-owner grace.
+      assertPtyConsumerOwnerRecovery(hello, authentication, this.owner)
+    }
     const owner = this.selectOwner(hello, authentication)
     const grant = Object.freeze({
       protocolVersion: PTY_CONSUMER_SESSION_PROTOCOL_VERSION,
@@ -151,6 +182,15 @@ export class PtyConsumerSession {
   activeGrant(connectionId: string): Readonly<PtyConsumerSessionGrant> | null {
     const client = this.clients.get(connectionId)
     return client?.state === 'active' ? client.grant : null
+  }
+
+  /** The authenticated client identity behind an active connection, or null.
+   *
+   *  Why the host reads it here instead of taking a spawn parameter: this is what makes a later
+   *  "this PTY belongs to you" attestation evidence rather than an echo of what a caller claimed. */
+  activeClientInstanceId(connectionId: string): string | null {
+    const client = this.clients.get(connectionId)
+    return client?.state === 'active' ? client.clientInstanceId : null
   }
 
   private admissionFor(

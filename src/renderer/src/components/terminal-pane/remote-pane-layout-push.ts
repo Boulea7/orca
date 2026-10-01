@@ -1,4 +1,4 @@
-import type { TerminalLayoutSnapshot } from '../../../../shared/types'
+import type { TerminalLayoutSnapshot } from '../../../../shared/terminal-tab-types'
 import { terminalLayoutEqual } from '@/lib/terminal-layout-equality'
 import { updateWebRuntimePaneLayout } from '@/runtime/web-runtime-session'
 
@@ -35,6 +35,7 @@ export function createRemotePaneLayoutPusher(): RemotePaneLayoutPusher {
         tabId,
         root: layout.root,
         expandedLeafId: layout.expandedLeafId,
+        chatLeafId: layout.chatLeafId ?? null,
         ...(layout.titlesByLeafId ? { titlesByLeafId: layout.titlesByLeafId } : {})
       }).then((updated) => {
         // Why: a disconnected or timed-out push carried no information, so the next persist must retry it.

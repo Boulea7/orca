@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { SERVE_REPLACEMENT_READY_TIMEOUT_MS } from '../../shared/startup-readiness-deadlines'
+import { SERVE_SUPERVISED_SHUTDOWN_GRACE_MS } from '../../shared/serve-supervision'
 import { getServeUpdateHandoffPath } from '../../shared/serve-update-handoff'
 import { waitForForegroundServeChild } from './serve-child-monitor'
 import type { ServeRuntimeHealth } from './serve-runtime-health'
@@ -28,6 +28,26 @@ const userQuit = { type: 'orca:serve-user-quit' }
 afterEach(() => vi.useRealTimers())
 
 describe('committed serve user quit monitor', () => {
+  it('does not extend the exit deadline for duplicate committed quit messages', async () => {
+    vi.useFakeTimers()
+    const child = new Child()
+    const result = waitForForegroundServeChild(child as never, null, {
+      healthCheckIntervalMs: 10,
+      healthProbeTimeoutMs: 1_000,
+      healthFailureLimit: 1
+    })
+    child.emit('message', userQuit)
+    await vi.advanceTimersByTimeAsync(20_000)
+    child.emit('message', userQuit)
+    await vi.advanceTimersByTimeAsync(SERVE_SUPERVISED_SHUTDOWN_GRACE_MS - 20_001)
+    expect(child.kill).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(child.kill).toHaveBeenCalledExactlyOnceWith('SIGKILL')
+    child.emit('exit', null, 'SIGKILL')
+    await expect(result).resolves.toMatchObject({ userQuitRequested: true, signal: 'SIGKILL' })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('cancels health scheduling and ignores an unhealthy probe that settles during teardown', async () => {
     vi.useFakeTimers()
     const child = new Child()
@@ -89,7 +109,7 @@ describe('committed serve user quit monitor', () => {
     )
     child.emit('message', userQuit)
     child.emit('message', ready)
-    await vi.advanceTimersByTimeAsync(SERVE_REPLACEMENT_READY_TIMEOUT_MS + 1)
+    await vi.advanceTimersByTimeAsync(SERVE_SUPERVISED_SHUTDOWN_GRACE_MS - 1)
     expect(child.kill).not.toHaveBeenCalled()
     expect(complete).not.toHaveBeenCalled()
     expect(recordFailure).not.toHaveBeenCalled()

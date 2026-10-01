@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { createElement } from 'react'
 import type * as ReactModule from 'react'
 import type { ProviderRateLimits } from '../../../../shared/rate-limit-types'
 
@@ -53,7 +54,8 @@ const PROVIDER_IDS: ProviderRateLimits['provider'][] = [
   'opencode-go',
   'kimi',
   'minimax',
-  'grok'
+  'grok',
+  'zcode'
 ]
 
 afterEach(() => {
@@ -293,6 +295,18 @@ describe('provider usage error copy', () => {
 })
 
 describe('getWindowSections', () => {
+  it('keeps ZCode Coding Plan windows separate from MCP quota', () => {
+    const session = { usedPercent: 25, windowMinutes: 300, resetsAt: null, resetDescription: null }
+    const weekly = { usedPercent: 40, windowMinutes: 10080, resetsAt: null, resetDescription: null }
+    const mcp = { usedPercent: 10, windowMinutes: 43200, resetsAt: null, resetDescription: null }
+    const sections = getWindowSections(
+      provider({ provider: 'zcode', session, weekly, monthly: mcp })
+    )
+
+    expect(sections.map((section) => section.label)).toEqual(['Session', 'Weekly', 'MCP'])
+    expect(sections[2].window).toBe(mcp)
+  })
+
   it('returns buckets as sections when present', () => {
     const p: ProviderRateLimits = {
       provider: 'gemini',
@@ -463,7 +477,7 @@ describe('ProviderPanel reset rendering', () => {
       }
     })
 
-    const markup = renderToStaticMarkup(ProviderPanel({ p }))
+    const markup = renderToStaticMarkup(createElement(ProviderPanel, { p }))
 
     expect(markup).toContain('Fable')
     expect(markup).toContain('Resets in 6d 17h')
@@ -483,7 +497,7 @@ describe('ProviderPanel reset rendering', () => {
       }
     })
 
-    const markup = renderToStaticMarkup(ProviderPanel({ p }))
+    const markup = renderToStaticMarkup(createElement(ProviderPanel, { p }))
 
     // Why: bars show consumption (% used), matching harness meters (#7551).
     expect(markup).toContain('35%')
@@ -505,7 +519,7 @@ describe('ProviderPanel reset rendering', () => {
       }
     })
 
-    const markup = renderToStaticMarkup(ProviderPanel({ p }))
+    const markup = renderToStaticMarkup(createElement(ProviderPanel, { p }))
 
     expect(markup).toContain('100%')
     expect(markup).toContain('% used')
@@ -525,7 +539,7 @@ describe('ProviderPanel reset rendering', () => {
       }
     })
 
-    const markup = renderToStaticMarkup(ProviderPanel({ p }))
+    const markup = renderToStaticMarkup(createElement(ProviderPanel, { p }))
 
     expect(markup).toContain('100%')
     expect(markup).toContain('width:100%')
@@ -544,7 +558,9 @@ describe('ProviderPanel reset rendering', () => {
       }
     })
 
-    const markup = renderToStaticMarkup(ProviderPanel({ p, usagePercentageDisplay: 'remaining' }))
+    const markup = renderToStaticMarkup(
+      createElement(ProviderPanel, { p, usagePercentageDisplay: 'remaining' })
+    )
 
     expect(markup).toContain('75% left')
     expect(markup).toContain('width:75%')

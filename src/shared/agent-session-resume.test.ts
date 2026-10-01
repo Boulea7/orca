@@ -12,14 +12,6 @@ describe('agent session resume metadata', () => {
     expect(isResumableTuiAgent('devin')).toBe(true)
   })
 
-  it('treats omp as a resumable TUI agent', () => {
-    expect(isResumableTuiAgent('omp')).toBe(true)
-  })
-
-  it('treats Prime Agent as a resumable TUI agent', () => {
-    expect(isResumableTuiAgent('prime-agent')).toBe(true)
-  })
-
   it.each([
     ['claude', { session_id: 'claude-session' }, { key: 'session_id', id: 'claude-session' }],
     ['codex', { session_id: 'codex-session' }, { key: 'session_id', id: 'codex-session' }],
@@ -44,6 +36,17 @@ describe('agent session resume metadata', () => {
       'prime-agent',
       { session_id: 'prime-session', session_file: '/tmp/prime-session.jsonl' },
       { key: 'session_id', id: 'prime-session', transcriptPath: '/tmp/prime-session.jsonl' }
+    ],
+    [
+      'copilot',
+      { session_id: '940237d9-c712-48e8-bca1-fd75fc4a8d4b' },
+      { key: 'session_id', id: '940237d9-c712-48e8-bca1-fd75fc4a8d4b' }
+    ],
+    ['copilot', { sessionId: 'copilot-camel' }, { key: 'session_id', id: 'copilot-camel' }],
+    [
+      'kimi',
+      { session_id: 'session_431324d7-2165-42f0-9ecd-9f93437b3201' },
+      { key: 'session_id', id: 'session_431324d7-2165-42f0-9ecd-9f93437b3201' }
     ]
   ] as const)('extracts %s provider session ids', (source, payload, expected) => {
     expect(extractAgentProviderSession(source, payload)).toEqual(expected)
@@ -51,6 +54,7 @@ describe('agent session resume metadata', () => {
 
   it.each([
     ['claude', { key: 'session_id', id: 's1' }, ['claude', '--resume', 's1']],
+    ['codebuddy', { key: 'session_id', id: 's1' }, ['codebuddy', '--resume', 's1']],
     ['codex', { key: 'session_id', id: 's1' }, ['codex', 'resume', 's1']],
     ['gemini', { key: 'session_id', id: 's1' }, ['gemini', '--resume', 's1']],
     ['antigravity', { key: 'conversation_id', id: 's1' }, ['agy', '--conversation', 's1']],
@@ -69,6 +73,12 @@ describe('agent session resume metadata', () => {
       'prime-agent',
       { key: 'session_id', id: 's1', transcriptPath: '/tmp/prime-session.jsonl' },
       ['prime-agent', '--resume', '/tmp/prime-session.jsonl']
+    ],
+    ['copilot', { key: 'session_id', id: 's1' }, ['copilot', '--resume=s1']],
+    [
+      'kimi',
+      { key: 'session_id', id: 'session_431324d7' },
+      ['kimi', '--session', 'session_431324d7']
     ]
   ] as const)('builds %s resume argv', (agent, providerSession, expected) => {
     expect(getAgentResumeArgv(agent, providerSession)).toEqual(expected)
@@ -140,5 +150,36 @@ describe('agent session resume metadata', () => {
         transcriptPath: '/tmp/bad\npath.jsonl'
       })
     ).toEqual({ key: 'session_id', id: 'ok' })
+  })
+})
+
+describe('OMP recorded resume locators', () => {
+  it.each([
+    {
+      explicit: '/explicit/session.jsonl',
+      recorded: '/hook/session.jsonl',
+      target: '/explicit/session.jsonl'
+    },
+    { explicit: undefined, recorded: ' /hook/session.jsonl ', target: '/hook/session.jsonl' },
+    { explicit: ' ', recorded: '/hook/session.jsonl', target: '/hook/session.jsonl' },
+    { explicit: undefined, recorded: ' ', target: 'session-id' },
+    { explicit: undefined, recorded: undefined, target: 'session-id' }
+  ])('selects explicit then recorded path then UUID %j', ({ explicit, recorded, target }) => {
+    expect(
+      getAgentResumeArgv(
+        'omp',
+        { key: 'session_id', id: 'session-id', transcriptPath: recorded },
+        explicit
+      )
+    ).toEqual(['omp', '--resume', target])
+  })
+  it('retains UUID equality when hook path metadata arrives later', () => {
+    expect(
+      agentProviderSessionsEqual(
+        'omp',
+        { key: 'session_id', id: 'session-id' },
+        { key: 'session_id', id: 'session-id', transcriptPath: '/hook/session.jsonl' }
+      )
+    ).toBe(true)
   })
 })

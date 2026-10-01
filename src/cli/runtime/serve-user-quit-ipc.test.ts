@@ -6,6 +6,7 @@ import ts from 'typescript-api'
 import { describe, expect, it, vi } from 'vitest'
 import {
   SERVE_SUPERVISOR_ENV,
+  SERVE_SUPERVISED_SHUTDOWN_GRACE_MS,
   SERVE_SUPERVISOR_STOP_EXIT_CODE
 } from '../../shared/serve-supervision'
 import { superviseForegroundServe } from './serve-update-supervisor'
@@ -23,7 +24,10 @@ function childSource(): string {
     new Function('exports', 'require', source)(exports, (name) => imports[name] ?? require(name))
     return exports
   }
-  const supervision = load(${JSON.stringify(compiledSource('src/shared/serve-supervision.ts'))})
+  const deadline = load(${JSON.stringify(compiledSource('src/shared/quit-teardown-deadline.ts'))})
+  const supervision = load(${JSON.stringify(compiledSource('src/shared/serve-supervision.ts'))}, {
+    './quit-teardown-deadline': deadline
+  })
   const messages = load(${JSON.stringify(compiledSource('src/shared/serve-update-handoff.ts'))})
   const sender = load(${JSON.stringify(compiledSource('src/main/serve-update-handoff.ts'))}, {
     electron: { app: { getVersion: () => '1.4.181' } },
@@ -34,7 +38,10 @@ function childSource(): string {
   function quit() {
     sender.markServeUserQuit()
     sender.notifyServeSupervisorUserQuit(true, false)
-      .then(() => process.exit(0), () => process.exit(1))
+      .then(() => {
+        if (process.env.ORCA_QUIT_FIXTURE_HANG === '1') setInterval(() => {}, 1000)
+        else process.exit(0)
+      }, () => process.exit(1))
   }
   process.on('message', (message) => {
     if (message === 'quit') quit()
@@ -48,6 +55,68 @@ function childSource(): string {
 }
 
 describe('foreground serve user quit over IPC', () => {
+  it('bounds a committed user quit that never exits without spawning a replacement', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const childEnv = {
+      ...process.env,
+      [SERVE_SUPERVISOR_ENV]: '1',
+      ORCA_QUIT_FIXTURE_READY: '0',
+      ORCA_QUIT_FIXTURE_HANG: '1'
+    }
+    for (const key of ['HOME', 'CODEX_HOME']) {
+      expect(key in childEnv).toBe(key in process.env)
+      expect(childEnv[key]).toBe(process.env[key])
+    }
+    const child = spawn(process.execPath, ['-e', childSource()], {
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+    })
+    const closed = once(child, 'close')
+    const message = once(child, 'message')
+    let childStderr = ''
+    child.stderr?.on('data', (chunk) => {
+      childStderr += String(chunk)
+    })
+    const kill = vi.spyOn(child, 'kill')
+    const spawnChild = vi.fn()
+    const sleep = vi.fn(async () => undefined)
+    const result = superviseForegroundServe({
+      child,
+      executable: process.execPath,
+      childArgs: [],
+      spawnOptions: {},
+      spawnChild,
+      handoffPath: null,
+      expectedHandoff: null,
+      sleep
+    })
+    try {
+      const firstMessage = await Promise.race([
+        message,
+        closed.then((exit) => {
+          throw new Error(`Fixture exited before IPC: ${exit}; ${childStderr}`)
+        })
+      ])
+      expect(firstMessage[0]).toEqual({ type: 'orca:serve-user-quit' })
+      await vi.advanceTimersByTimeAsync(SERVE_SUPERVISED_SHUTDOWN_GRACE_MS - 1)
+      expect(kill).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(kill).toHaveBeenCalledWith('SIGKILL')
+      expect(await closed).toEqual([null, 'SIGKILL'])
+      await expect(result).resolves.toBe(SERVE_SUPERVISOR_STOP_EXIT_CODE)
+      expect(spawnChild).not.toHaveBeenCalled()
+      expect(sleep).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL')
+      }
+      await closed
+      await result
+      vi.restoreAllMocks()
+    }
+  }, 5_000)
+
   it.each([false, true])(
     'stops after production user quit IPC (ready=%s) and clean exit',
     async (ready) => {

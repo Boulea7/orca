@@ -40,7 +40,9 @@ describe('sftp-upload', () => {
     })
     const writeStream = vi.mocked(sftp.createWriteStream).mock.results[0]?.value as Writable
     expect(writeStream.listenerCount('close')).toBe(0)
-    expect(writeStream.listenerCount('error')).toBe(0)
+    // One durable 'error' listener stays for the stream's whole life: a STATUS reply that
+    // lands after the transfer settles must not throw into ssh2's parser (#15479).
+    expect(writeStream.listenerCount('error')).toBe(1)
   })
 
   it('uses no-clobber writes for nested files during exclusive directory upload', async () => {
@@ -59,7 +61,9 @@ describe('sftp-upload', () => {
     })
     const writeStream = vi.mocked(sftp.createWriteStream).mock.results[0]?.value as Writable
     expect(writeStream.listenerCount('close')).toBe(0)
-    expect(writeStream.listenerCount('error')).toBe(0)
+    // One durable 'error' listener stays for the stream's whole life: a STATUS reply that
+    // lands after the transfer settles must not throw into ssh2's parser (#15479).
+    expect(writeStream.listenerCount('error')).toBe(1)
   })
 
   it('uploads files from valid dot-dot-prefixed local directories', async () => {
@@ -77,6 +81,47 @@ describe('sftp-upload', () => {
       flags: 'wx'
     })
   })
+
+  it('accepts a root named through a symlink or short name that realpath rewrites', async () => {
+    const realDir = await mkdtemp(join(tmpdir(), 'orca-sftp-upload-'))
+    await writeFile(join(realDir, 'asset.txt'), 'asset')
+    const aliasDir = `${realDir}-alias`
+    // Why a junction on Windows: directory symlinks need Developer Mode or admin there.
+    await symlink(realDir, aliasDir, process.platform === 'win32' ? 'junction' : 'dir')
+    const sftp = createSftpMock()
+
+    await uploadDirectory(sftp, aliasDir, '/remote/assets')
+
+    expect(sftp.createWriteStream).toHaveBeenCalledWith('/remote/assets/asset.txt', {
+      flags: 'w'
+    })
+    await rm(aliasDir, { force: true })
+    await rm(realDir, { recursive: true, force: true })
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'uploads a root reached through a symlinked parent',
+    async () => {
+      const realParent = await mkdtemp(join(tmpdir(), 'orca-sftp-upload-'))
+      await mkdir(join(realParent, 'root'))
+      await writeFile(join(realParent, 'root', 'asset.txt'), 'asset')
+      const linkedParent = `${realParent}-link`
+      await symlink(realParent, linkedParent)
+      try {
+        const localDir = join(linkedParent, 'root')
+        const sftp = createSftpMock()
+
+        await uploadDirectory(sftp, localDir, '/remote/assets', localDir)
+
+        expect(sftp.createWriteStream).toHaveBeenCalledWith('/remote/assets/asset.txt', {
+          flags: 'w'
+        })
+      } finally {
+        await rm(linkedParent, { force: true })
+        await rm(realParent, { recursive: true, force: true })
+      }
+    }
+  )
 
   it('rejects sibling directories outside the upload root', async () => {
     const localDir = await mkdtemp(join(tmpdir(), 'orca-sftp-upload-'))

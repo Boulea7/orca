@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { readlinkSync } from 'node:fs'
-import { mkdtemp, rm, symlink } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, symlink } from 'node:fs/promises'
 import type * as Filesystem from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,24 +14,46 @@ import {
   type ServeSingletonRecoveryResult
 } from './serve-singleton-recovery'
 import { superviseForegroundServe } from './serve-update-supervisor'
+import {
+  removeAbandonedServeSingletonQuarantines,
+  removeServeSingletonQuarantine
+} from './serve-singleton-quarantine'
+import { prepareLinuxServeSupervision } from './serve-linux-supervision-startup'
 
 const guardFault = vi.hoisted(() => ({
   path: '',
   companionPath: '',
   armed: false,
   unlinkCode: null as string | null,
+  unlinkFailuresRemaining: null as number | null,
   readlinkCode: null as string | null,
   renameCode: null as string | null,
   afterMove: null as 'remove' | 'replace' | null,
-  replacementTarget: ''
+  replacementTarget: '',
+  backupPath: '',
+  backupUnlinkFailures: 0
 }))
+
+vi.mock('./serve-runtime-health', () => ({ probeServeRuntimeHealth: vi.fn() }))
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const filesystem = await importOriginal<typeof Filesystem>()
   return {
     ...filesystem,
     unlink: async (...args: Parameters<typeof filesystem.unlink>) => {
-      if (guardFault.armed && String(args[0]) === guardFault.path && guardFault.unlinkCode) {
+      if (String(args[0]) === guardFault.backupPath && guardFault.backupUnlinkFailures > 0) {
+        guardFault.backupUnlinkFailures -= 1
+        throw Object.assign(new Error('backup unlink failed'), { code: 'EPERM' })
+      }
+      if (
+        guardFault.armed &&
+        String(args[0]) === guardFault.path &&
+        guardFault.unlinkCode &&
+        guardFault.unlinkFailuresRemaining !== 0
+      ) {
+        if (guardFault.unlinkFailuresRemaining !== null) {
+          guardFault.unlinkFailuresRemaining -= 1
+        }
         if (guardFault.unlinkCode === 'ENOENT') {
           await filesystem.unlink(...args)
         }
@@ -77,10 +99,13 @@ describe.skipIf(process.platform === 'win32')('serve singleton guard release', (
       companionPath: '',
       armed: false,
       unlinkCode: null,
+      unlinkFailuresRemaining: null,
       readlinkCode: null,
       renameCode: null,
       afterMove: null,
-      replacementTarget: ''
+      replacementTarget: '',
+      backupPath: '',
+      backupUnlinkFailures: 0
     })
     vi.restoreAllMocks()
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
@@ -96,19 +121,123 @@ describe.skipIf(process.platform === 'win32')('serve singleton guard release', (
     return root
   }
 
-  function recoverProfile(root: string): Promise<ServeSingletonRecoveryResult> {
+  function recoverProfile(
+    root: string,
+    suffix = 'guard-test'
+  ): Promise<ServeSingletonRecoveryResult> {
     return recoverStaleServeSingleton(root, {
       platform: 'linux',
       probeHealth: async () => ({ healthy: false, reason: 'metadata_missing' }),
       isProcessAlive: () => false,
       wait: async () => undefined,
-      quarantineSuffix: 'guard-test',
+      quarantineSuffix: suffix,
       createRecoveryGuardLink: async (target, path) => {
         await symlink(target, path)
         guardFault.armed = true
       }
     })
   }
+
+  it('retains the original lock when rollback cannot unlink its own guard once', async () => {
+    const root = await createProfile()
+    guardFault.renameCode = 'EIO'
+    guardFault.unlinkCode = 'EPERM'
+    guardFault.unlinkFailuresRemaining = 1
+
+    await expect(recoverProfile(root)).resolves.toMatchObject({
+      state: 'not-recoverable',
+      reason: 'quarantine_failed',
+      errorCode: 'EIO'
+    })
+    const targets = (await readdir(root))
+      .filter((name) => name.startsWith('SingletonLock'))
+      .map((name) => {
+        try {
+          return readlinkSync(join(root, name))
+        } catch {
+          return null
+        }
+      })
+    expect(targets).toContain(`${hostname()}-987654`)
+  })
+
+  it('preserves unconfirmed rollback evidence across scanning and the next startup', async () => {
+    const root = await createProfile()
+    const suffix = 'stale-1000-2147483647'
+    guardFault.renameCode = 'EIO'
+    guardFault.unlinkCode = 'EPERM'
+    guardFault.unlinkFailuresRemaining = 1
+    const recovery = await recoverProfile(root, suffix)
+
+    expect(recovery).toEqual({
+      state: 'not-recoverable',
+      reason: 'quarantine_failed',
+      errorCode: 'EIO'
+    })
+    const backup = join(root, `SingletonLock.${suffix}`)
+    expect(readlinkSync(backup)).toBe(`${hostname()}-987654`)
+    await expect(removeAbandonedServeSingletonQuarantines(root, root, () => false)).rejects.toThrow(
+      'Unconfirmed singleton backup'
+    )
+    const childEnv: NodeJS.ProcessEnv = {}
+    await expect(prepareLinuxServeSupervision(root, root, childEnv)).rejects.toThrow(
+      'Unconfirmed singleton backup'
+    )
+    expect(childEnv.ORCA_SERVE_SUPERVISED).toBeUndefined()
+    expect(readlinkSync(backup)).toBe(`${hostname()}-987654`)
+    expect(readlinkSync(guardFault.path)).toBe(`${hostname()}-${process.pid}`)
+    expect(await readdir(root)).not.toContain(`SingletonRecoveryCommit.${suffix}`)
+  })
+
+  it('cleans only completed quarantine paths when guard release prevents recovery', async () => {
+    const root = await createProfile()
+    guardFault.unlinkCode = 'EPERM'
+    const child = new ServeChild()
+    const spawnChild = vi.fn()
+    const sleep = vi.fn(async () => undefined)
+    const result = superviseForegroundServe({
+      executable: '/opt/orca/orca',
+      childArgs: ['--serve'],
+      spawnOptions: {},
+      spawnChild,
+      handoffPath: null,
+      child: child as never,
+      expectedHandoff: null,
+      recoverSingleton: () => recoverProfile(root),
+      cleanupSingletonQuarantine: (paths) => removeServeSingletonQuarantine(root, paths),
+      sleep
+    })
+    child.emit('exit', SERVE_ALREADY_RUNNING_EXIT_CODE, null)
+
+    await expect(result).resolves.toBe(SERVE_ALREADY_RUNNING_EXIT_CODE)
+    expect(readlinkSync(guardFault.path)).toBe(`${hostname()}-${process.pid}`)
+    expect(await readdir(root)).toEqual(['SingletonLock'])
+    expect(spawnChild).not.toHaveBeenCalled()
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('retries removal of a duplicate backup after the original lock was restored', async () => {
+    const root = await createProfile()
+    const suffix = 'stale-1000-2147483647'
+    const backup = join(root, `SingletonLock.${suffix}`)
+    guardFault.renameCode = 'EIO'
+    guardFault.backupPath = backup
+    guardFault.backupUnlinkFailures = 1
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    await expect(recoverProfile(root, suffix)).resolves.toEqual({
+      state: 'not-recoverable',
+      reason: 'quarantine_failed',
+      errorCode: 'EIO'
+    })
+    expect(readlinkSync(guardFault.path)).toBe(`${hostname()}-987654`)
+    expect(readlinkSync(backup)).toBe(`${hostname()}-987654`)
+    const childEnv: NodeJS.ProcessEnv = {}
+    await expect(prepareLinuxServeSupervision(root, root, childEnv)).resolves.toBeUndefined()
+    expect(childEnv.ORCA_SERVE_SUPERVISED).toBe('1')
+    expect(await readdir(root)).not.toContain(`SingletonLock.${suffix}`)
+    expect(readlinkSync(guardFault.path)).toBe(`${hostname()}-987654`)
+  })
 
   it('refuses replacement when its live recovery guard cannot be removed', async () => {
     const root = await createProfile()
@@ -142,7 +271,16 @@ describe.skipIf(process.platform === 'win32')('serve singleton guard release', (
 
     expect(readlinkSync(guardFault.path)).toBe(`${hostname()}-${process.pid}`)
     expect(recoveries).toEqual([
-      { state: 'not-recoverable', reason: 'quarantine_failed', errorCode: 'EPERM' }
+      {
+        state: 'not-recoverable',
+        reason: 'quarantine_failed',
+        errorCode: 'EPERM',
+        cleanupPaths: [
+          'SingletonCookie.guard-test',
+          'SingletonLock.guard-test',
+          'SingletonRecoveryCommit.guard-test'
+        ]
+      }
     ])
     expect(code).toBe(SERVE_ALREADY_RUNNING_EXIT_CODE)
     expect(spawnChild).not.toHaveBeenCalled()
@@ -193,7 +331,7 @@ describe.skipIf(process.platform === 'win32')('serve singleton guard release', (
     const root = await createProfile()
     guardFault.renameCode = 'EIO'
     guardFault.unlinkCode = 'EPERM'
-    const diagnostic = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const diagnostic = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
 
     await expect(recoverProfile(root)).resolves.toEqual({
       state: 'not-recoverable',
@@ -202,7 +340,9 @@ describe.skipIf(process.platform === 'win32')('serve singleton guard release', (
     })
     expect(readlinkSync(guardFault.path)).toBe(`${hostname()}-${process.pid}`)
     expect(diagnostic).toHaveBeenCalledWith(
-      '[serve] could not release singleton recovery guard (EPERM).\n'
+      '[serve] Could not remove guard for singleton rollback:',
+      expect.objectContaining({ code: 'EPERM' })
     )
+    expect(readlinkSync(join(root, 'SingletonLock.guard-test'))).toBe(`${hostname()}-987654`)
   })
 })

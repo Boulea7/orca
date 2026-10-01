@@ -9,7 +9,7 @@ import * as supervisorMessages from '../shared/serve-update-handoff'
 import * as supervision from '../shared/serve-supervision'
 import * as menuKeybindings from '../shared/keybindings'
 import { QuitTeardownStartGate } from './quit-teardown-start-gate'
-import { settleTeardownWithinDeadline } from './quit-teardown-deadline'
+import { settleTeardownWithinDeadline, settleWithinMs } from './quit-teardown-deadline'
 import { shouldQuitWhenAllWindowsClosed } from './startup/window-all-closed-quit-policy'
 
 function readSource(path: string): ts.SourceFile {
@@ -73,7 +73,7 @@ function evaluate(source: string, context: Record<string, unknown>): void {
 }
 
 // The callbacks and teardown are the shipped registrations; services outside quit are stubs.
-function loadQuitWiring(
+async function loadQuitWiring(
   options: {
     veto?: boolean
     confirmation?: boolean
@@ -90,6 +90,7 @@ function loadQuitWiring(
   let deferConfirmation = options.confirmation === true
   let lastEvent: { preventDefault(): void; prevented: boolean } | undefined
   let completeSend: (() => void) | undefined
+  let recoveryPromptQuit: (() => void) | undefined
   const warn = vi.fn()
   const send = vi.fn((_message: unknown, callback: (error: Error | null) => void) => {
     if (options.sendFailure === 'throw') {
@@ -152,10 +153,16 @@ function loadQuitWiring(
       connected: options.connected !== false,
       platform: 'linux',
       pid: process.pid,
-      send
+      send,
+      once: vi.fn()
     },
     mainWindow: window,
-    store: { getSettings: () => ({ appIcon: 'orca' }), getUI: () => ({}), flushAsync: storeFlush },
+    store: {
+      getSettings: () => ({ appIcon: 'orca' }),
+      getUI: () => ({}),
+      flushFinalOrThrowAsync: storeFlush,
+      freezeWritesAsync: async () => undefined
+    },
     isQuitting: false,
     isServeMode: true,
     options: {},
@@ -164,6 +171,8 @@ function loadQuitWiring(
     isQuittingForUpdate: () => options.update === true,
     quitTeardownStartGate: new QuitTeardownStartGate(),
     settleTeardownWithinDeadline,
+    settleWithinMs,
+    REF_MAINTENANCE_QUIT_DEADLINE_MS: 2_000,
     shouldQuitWhenAllWindowsClosed,
     createMainWindow: (_store: unknown, callbacks: Record<string, unknown>) => {
       windowOptions = callbacks
@@ -247,6 +256,17 @@ function loadQuitWiring(
     }
   })
   Object.assign(context, exports)
+  const quitMenuExports: Record<string, unknown> = {}
+  evaluate(readFileSync(join(process.cwd(), 'src/main/menu/app-menu-quit-item.ts'), 'utf8'), {
+    ...context,
+    exports: quitMenuExports,
+    require: (name: string) => {
+      if (name === '../i18n/main-i18n') {
+        return { translateMain: (_key: string, fallback: string) => fallback }
+      }
+      return require(name)
+    }
+  })
   const menuExports: Record<string, unknown> = {}
   evaluate(readFileSync(join(process.cwd(), 'src/main/menu/register-app-menu.ts'), 'utf8'), {
     ...context,
@@ -273,48 +293,79 @@ function loadQuitWiring(
       if (name === './app-menu-selection-item') {
         return { createAppMenuSelectionItem: () => ({}) }
       }
+      if (name === './app-menu-quit-item') {
+        return quitMenuExports
+      }
       return require(name)
     }
   })
   Object.assign(context, menuExports)
-  const source = readSource('src/main/index.ts')
-  const trayOptionsFunction = findSyntax(
-    source,
-    (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'getSystemTrayOptions'
-  )
-  const quitReference = findSyntax(
-    trayOptionsFunction,
-    (node) => ts.isPropertyAssignment(node) && node.name.getText(source) === 'onQuit'
-  ) as ts.PropertyAssignment
+  const actions = readSource('src/main/startup/main-window-actions.ts')
+  const controller = readSource('src/main/startup/main-window-controller.ts')
+  const menu = readSource('src/main/startup/main-process-i18n-menu.ts')
+  const quit = readSource('src/main/startup/main-process-quit.ts')
+  context.state = context
+  context.exports = {}
+  context.safelyRevealWindow = vi.fn()
+  context.ensureMainI18n = async () => undefined
+  context.setMainUiLanguage = async () => undefined
+  context.menuInitializationPromise = Promise.resolve()
+  context.require = () => ({ closeAllLocalSshBrowserRoutes: async () => undefined })
+  for (const source of [actions, controller, menu, quit]) {
+    for (const node of source.statements) {
+      if (
+        !ts.isImportDeclaration(node) ||
+        !node.importClause?.namedBindings ||
+        !ts.isNamedImports(node.importClause.namedBindings)
+      ) {
+        continue
+      }
+      for (const binding of node.importClause.namedBindings.elements) {
+        const name = binding.name.text
+        if (!(name in context)) {
+          context[name] = vi.fn(async () => undefined)
+        }
+      }
+    }
+  }
+  for (const match of quit.text.matchAll(/state\.(\w+)/g)) {
+    if (!(match[1] in context)) {
+      context[match[1]] = null
+    }
+  }
+  context.presentRendererRecoveryPrompt = vi.fn(async (options: { quit(): void }) => {
+    recoveryPromptQuit = options.quit
+  })
   evaluate(
     [
-      functionText(source, 'showMainWindowFromTray'),
-      functionText(source, quitReference.initializer.getText(source)),
-      functionText(source, 'getSystemTrayOptions'),
-      variableText(source, 'window'),
-      variableText(source, 'trayCreated'),
-      variableText(source, 'createSystemTrayDeferred'),
-      'createSystemTrayDeferred()',
-      findSyntax(
-        source,
-        (node) => ts.isCallExpression(node) && node.expression.getText(source) === 'registerAppMenu'
-      ).parent.getText(source),
-      variableText(source, 'daemonDisconnectDone'),
-      registrationText(source, 'app', 'before-quit'),
-      registrationText(source, 'app', 'will-quit'),
-      registrationText(source, 'app', 'window-all-closed')
+      functionText(actions, 'showMainWindowFromTray'),
+      functionText(actions, 'requestUserQuit'),
+      functionText(actions, 'getSystemTrayOptions'),
+      functionText(actions, 'createSystemTrayDeferred'),
+      functionText(actions, 'showRendererRecoveryPrompt'),
+      variableText(controller, 'window'),
+      'createSystemTrayDeferred(window)()',
+      functionText(menu, 'initializeMainProcessI18nAndMenu'),
+      'menuInitializationPromise = initializeMainProcessI18nAndMenu()',
+      variableText(quit, 'daemonDisconnectDone'),
+      functionText(quit, 'installBeforeQuitHandler'),
+      functionText(quit, 'installWillQuitHandler'),
+      functionText(quit, 'installWindowAllClosedHandler'),
+      functionText(quit, 'installMainProcessQuitHandlers'),
+      'installMainProcessQuitHandlers()'
     ].join('\n'),
     context
   )
+  await context.menuInitializationPromise
   const windowContext = {
     mainWindow: window,
     opts: windowOptions,
-    windowClosing: false,
+    state: { resumeBoundsPersistence: vi.fn() },
     clearQuitRendererAckTimer: vi.fn()
   }
   evaluate(
     registrationText(
-      readSource('src/main/window/createMainWindow.ts'),
+      readSource('src/main/window/main-window-close-lifecycle.ts'),
       'mainWindow.webContents',
       'will-prevent-unload'
     ),
@@ -330,6 +381,11 @@ function loadQuitWiring(
     daemonTeardown,
     quitEvents,
     quitFromTray: () => trayOptions!.onQuit(),
+    quitFromRecoveryPrompt: async () => {
+      await (context.showRendererRecoveryPrompt as (count: number) => Promise<void>)(3)
+      expect(recoveryPromptQuit).toBeTypeOf('function')
+      recoveryPromptQuit?.()
+    },
     confirmClose: () => app.emit('window-all-closed'),
     repeatWillQuit: () => app.emit('will-quit', lastEvent),
     completeSend: () => completeSend?.(),
@@ -350,7 +406,7 @@ afterEach(() => vi.useRealTimers())
 
 describe('registered tray user quit wiring', () => {
   it('notifies only a committed user quit while preserving the normal teardown and final quit', async () => {
-    const wiring = loadQuitWiring()
+    const wiring = await loadQuitWiring()
     wiring.quitFromTray()
     await vi.waitFor(() => expect(wiring.completed()).toBe(true))
 
@@ -363,7 +419,7 @@ describe('registered tray user quit wiring', () => {
 
   it('clears intent on the registered renderer veto, leaving a later health shutdown unmarked', async () => {
     const options = { veto: true }
-    const wiring = loadQuitWiring(options)
+    const wiring = await loadQuitWiring(options)
     wiring.quitFromTray()
     expect(wiring.completed()).toBe(false)
     expect(wiring.send).not.toHaveBeenCalled()
@@ -374,7 +430,7 @@ describe('registered tray user quit wiring', () => {
   })
 
   it('keeps user intent through renderer close confirmation rather than treating its delay as a veto', async () => {
-    const wiring = loadQuitWiring({ confirmation: true })
+    const wiring = await loadQuitWiring({ confirmation: true })
     wiring.quitFromTray()
     expect(wiring.send).not.toHaveBeenCalled()
     wiring.confirmClose()
@@ -383,14 +439,14 @@ describe('registered tray user quit wiring', () => {
   })
 
   it('does not mark an update install as a user stop', async () => {
-    const wiring = loadQuitWiring({ update: true })
+    const wiring = await loadQuitWiring({ update: true })
     wiring.quitFromTray()
     await vi.waitFor(() => expect(wiring.completed()).toBe(true))
     expect(wiring.send).not.toHaveBeenCalled()
   })
 
   it('uses the same committed path from the registered File Exit menu', async () => {
-    const wiring = loadQuitWiring()
+    const wiring = await loadQuitWiring()
     wiring.quitFromMenu()
     await vi.waitFor(() => expect(wiring.completed()).toBe(true))
     expect(wiring.send).toHaveBeenCalledOnce()
@@ -400,7 +456,7 @@ describe('registered tray user quit wiring', () => {
 
   it('clears pending intent if app.quit throws before committing teardown', async () => {
     const options = { quitThrows: true }
-    const wiring = loadQuitWiring(options)
+    const wiring = await loadQuitWiring(options)
     expect(wiring.quitFromTray).toThrow('quit rejected')
     options.quitThrows = false
     wiring.app.quit()
@@ -408,8 +464,17 @@ describe('registered tray user quit wiring', () => {
     expect(wiring.send).not.toHaveBeenCalled()
   })
 
+  it('uses the committed path from the registered renderer recovery prompt Quit action', async () => {
+    const wiring = await loadQuitWiring()
+    await wiring.quitFromRecoveryPrompt()
+    await vi.waitFor(() => expect(wiring.completed()).toBe(true))
+    expect(wiring.send).toHaveBeenCalledOnce()
+    expect(wiring.storeFlush).toHaveBeenCalledOnce()
+    expect(wiring.daemonTeardown).toHaveBeenCalledOnce()
+  })
+
   it('sends once and awaits delivery callback across repeated will-quit events', async () => {
-    const wiring = loadQuitWiring({ sendDeferred: true, sendFailure: 'backpressure' })
+    const wiring = await loadQuitWiring({ sendDeferred: true, sendFailure: 'backpressure' })
     wiring.quitFromTray()
     wiring.repeatWillQuit()
     await Promise.resolve()
@@ -423,7 +488,7 @@ describe('registered tray user quit wiring', () => {
 
   it('keeps the existing teardown deadline when the send callback never completes', async () => {
     vi.useFakeTimers()
-    const wiring = loadQuitWiring({ sendDeferred: true })
+    const wiring = await loadQuitWiring({ sendDeferred: true })
     wiring.quitFromTray()
     await vi.advanceTimersByTimeAsync(20_000)
     expect(wiring.completed()).toBe(true)
@@ -436,7 +501,7 @@ describe('registered tray user quit wiring', () => {
   it.each(['callback', 'throw'] as const)(
     'reports %s delivery failure without blocking normal quit',
     async (sendFailure) => {
-      const wiring = loadQuitWiring({ sendFailure })
+      const wiring = await loadQuitWiring({ sendFailure })
       wiring.quitFromTray()
       await vi.waitFor(() => expect(wiring.completed()).toBe(true))
       expect(wiring.warn).toHaveBeenCalledWith(
@@ -447,7 +512,7 @@ describe('registered tray user quit wiring', () => {
   )
 
   it('does not attempt delivery on a disconnected channel', async () => {
-    const wiring = loadQuitWiring({ connected: false })
+    const wiring = await loadQuitWiring({ connected: false })
     wiring.quitFromTray()
     await vi.waitFor(() => expect(wiring.completed()).toBe(true))
     expect(wiring.send).not.toHaveBeenCalled()

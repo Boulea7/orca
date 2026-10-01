@@ -8,6 +8,7 @@ import {
   type RemoteNodeResolutionOptions
 } from './ssh-remote-node-install-guidance'
 import { execCommand } from './ssh-relay-deploy-helpers'
+import { isSshExecTimeout } from './ssh-relay-exec-command'
 import {
   buildPosixNodeToolchainProbe,
   buildWindowsNodeToolchainProbe,
@@ -15,6 +16,7 @@ import {
 } from './ssh-remote-node-toolchain-probe'
 import { isSshSessionLimitError } from './ssh-session-limit-error'
 import { buildSshLoginShellCommand } from './ssh-login-shell-command'
+import { REMOTE_NODE_PATH_PROBE_SCRIPT } from './ssh-remote-node-probe-script'
 
 // Why: the login-shell fallback catches custom PATH setups in ~/.profile that
 // the path probes don't cover. Interactive configs (conda prompts, etc.) can
@@ -35,74 +37,42 @@ export async function resolveRemoteNodePath(
   // This doesn't depend on shell startup-file semantics — bash -lc skips
   // .bashrc and zsh -lc skips .zshrc, but those are exactly the files where
   // nvm/mise/asdf hooks live. Probing directories directly is deterministic.
-  const probedPath = await tryResolveViaKnownPaths(conn, options)
-  if (probedPath) {
-    return probedPath
+  const npmCheck: CandidateCheck<true> = async (candidate) =>
+    (await nodeToolchainMeetsRequirements(conn, candidate, options)) || null
+  const probed = await tryResolveViaKnownPaths(conn, npmCheck, options)
+  if (probed) {
+    return probed.nodePath
   }
 
   // Strategy 2 (fallback): ask the user's login shell. Catches custom PATH
   // setups in ~/.profile / ~/.bash_profile that the probes don't cover.
-  const loginShellPath = await tryResolveViaLoginShell(conn, options)
-  if (loginShellPath) {
-    return loginShellPath
+  const loginShell = await tryResolveViaLoginShell(conn, npmCheck, options)
+  if (loginShell) {
+    return loginShell.nodePath
   }
 
   return throwNodeNotFound(conn, options)
+}
+
+export type CandidateCheck<T> = (candidate: string) => Promise<T | null>
+type ResolvedCandidate<T> = { nodePath: string; result: T }
+/** `strict` rethrows unanswered probes rather than reading them as "no Node here". */
+export type ProbeOptions = RemoteNodeResolutionOptions & { strict?: boolean }
+
+function isUnansweredExec(err: unknown): boolean {
+  return isSshExecTimeout(err) || (err instanceof Error && 'sshChannelCloseConfirmed' in err)
 }
 
 // Probe the on-disk install directories of every common Node version manager
 // plus system package-manager locations. Every probe runs unconditionally so
 // a missing directory prints nothing rather than short-circuiting later
 // probes. Returns the first candidate with a complete Node/npm toolchain.
-async function tryResolveViaKnownPaths(
+export async function tryResolveViaKnownPaths<T>(
   conn: SshConnection,
-  options?: RemoteNodeResolutionOptions
-): Promise<string | null> {
-  const script = `
-command -v node 2>/dev/null
-nvm_dirs=\${NVM_DIR:-"$HOME/.nvm"}
-for nvm_file in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"
-do
-  [ -r "$nvm_file" ] || continue
-  nvm_dir_from_file=$(sed -n 's/^[[:space:]]*export[[:space:]][[:space:]]*NVM_DIR[[:space:]]*=[[:space:]]*//p; s/^[[:space:]]*NVM_DIR[[:space:]]*=[[:space:]]*//p' "$nvm_file" | tail -n 1)
-  case "$nvm_dir_from_file" in
-    \\"*\\") nvm_dir_from_file=\${nvm_dir_from_file#\\"}; nvm_dir_from_file=\${nvm_dir_from_file%%\\"*} ;;
-    \\'*\\') nvm_dir_from_file=\${nvm_dir_from_file#\\'}; nvm_dir_from_file=\${nvm_dir_from_file%%\\'*} ;;
-    *) nvm_dir_from_file=\${nvm_dir_from_file%%[[:space:]]*} ;;
-  esac
-  case "$nvm_dir_from_file" in
-    '$HOME'*) nvm_dir_from_file="$HOME\${nvm_dir_from_file#'$HOME'}" ;;
-    "~/"*) nvm_dir_from_file="$HOME/\${nvm_dir_from_file#\\~/}" ;;
-  esac
-  [ -n "$nvm_dir_from_file" ] && nvm_dirs="$nvm_dirs
-$nvm_dir_from_file"
-done
-printf '%s\\n' "$nvm_dirs" | while IFS= read -r nvm_dir
-do
-  [ -n "$nvm_dir" ] || continue
-  for candidate in "$nvm_dir"/versions/node/*/bin/node
-  do
-    [ -x "$candidate" ] && printf '%s\\n' "$candidate"
-  done
-done
-for candidate in \\
-  /usr/local/bin/node \\
-  /opt/homebrew/bin/node \\
-  "$HOME/.local/bin/node" \\
-  "$HOME/.fnm/aliases/default/bin/node" \\
-  "$HOME/.fnm/node-versions"/*/installation/bin/node \\
-  "$HOME/.local/share/fnm/node-versions"/*/installation/bin/node \\
-  "$HOME/.local/share/mise/shims/node" \\
-  "$HOME/.local/share/mise/installs/node"/*/bin/node \\
-  "$HOME/.asdf/shims/node" \\
-  "$HOME/.asdf/installs/nodejs"/*/bin/node \\
-  "$HOME/.volta/bin/node" \\
-  /usr/local/n/versions/node/*/bin/node
-do
-  [ -x "$candidate" ] && printf '%s\\n' "$candidate"
-done
-true
-`
+  check: CandidateCheck<T>,
+  options?: ProbeOptions
+): Promise<ResolvedCandidate<T> | null> {
+  const script = REMOTE_NODE_PATH_PROBE_SCRIPT
 
   try {
     const result = await execCommandWithOptionalOptions(conn, script, signalOnlyOptions(options))
@@ -113,9 +83,10 @@ true
         continue
       }
       seen.add(candidate)
-      if (await nodeToolchainMeetsRequirements(conn, candidate, options)) {
+      const result = await check(candidate)
+      if (result !== null) {
         console.log(`[ssh-relay] Found node via path probe: ${candidate}`)
-        return candidate
+        return { nodePath: candidate, result }
       }
     }
   } catch (err) {
@@ -123,6 +94,10 @@ true
       throw err
     }
     throwIfAborted(options)
+    // Why: the probe script always exits 0, so any failure here is an unanswered probe.
+    if (options?.strict) {
+      throw err
+    }
     // Fall through to login shell.
   }
   return null
@@ -131,10 +106,11 @@ true
 // Run `command -v node` under the user's login shell, then verify the result
 // meets the minimum version. Returns null on any failure (shell missing, no
 // node found, version too old, timeout) so callers fall through to the error.
-async function tryResolveViaLoginShell(
+export async function tryResolveViaLoginShell<T>(
   conn: SshConnection,
-  options?: RemoteNodeResolutionOptions
-): Promise<string | null> {
+  check: CandidateCheck<T>,
+  options?: ProbeOptions
+): Promise<ResolvedCandidate<T> | null> {
   try {
     // Why: $SHELL is the user's configured login shell (set by chsh / passwd).
     // Using it — rather than hardcoding bash — means zsh/fish users whose
@@ -160,15 +136,20 @@ async function tryResolveViaLoginShell(
       return null
     }
 
-    if (await nodeToolchainMeetsRequirements(conn, candidate, options)) {
+    const result = await check(candidate)
+    if (result !== null) {
       console.log(`[ssh-relay] Found node via login shell (${shell}): ${candidate}`)
-      return candidate
+      return { nodePath: candidate, result }
     }
   } catch (err) {
     if (options?.rethrowSessionLimitErrors && isSshSessionLimitError(err)) {
       throw err
     }
     throwIfAborted(options)
+    // Why only these: `command -v node` exits non-zero when the shell answered "none".
+    if (options?.strict && isUnansweredExec(err)) {
+      throw err
+    }
     // Fall through.
   }
   return null
@@ -303,7 +284,7 @@ function throwWindowsNodeNotFound(options?: RemoteNodeResolutionOptions): never 
   )
 }
 
-function throwIfAborted(options?: RemoteNodeResolutionOptions): void {
+export function throwIfAborted(options?: RemoteNodeResolutionOptions): void {
   // Why: strategy fallbacks intentionally swallow probe failures, but a shared
   // bootstrap abort must stay an AbortError so callers can continue fallback.
   if (options?.signal?.aborted) {
@@ -323,7 +304,7 @@ type RemoteExecOptions = {
   signal?: AbortSignal
 }
 
-function commandOptions(
+export function commandOptions(
   base: RemoteExecOptions,
   options?: RemoteNodeResolutionOptions
 ): RemoteExecOptions {

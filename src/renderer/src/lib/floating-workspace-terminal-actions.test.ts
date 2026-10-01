@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../shared/constants'
-import type { Tab, TerminalTab } from '../../../shared/types'
+import type { Tab } from '../../../shared/tab-types'
+import type { TerminalTab } from '../../../shared/terminal-tab-types'
 import {
   createFloatingWorkspaceBrowserTab,
   createFloatingWorkspaceMarkdownTab,
@@ -457,10 +458,10 @@ describe('createFloatingWorkspaceTerminalTab', () => {
     expect(store.createTab).toHaveBeenCalledWith(
       FLOATING_TERMINAL_WORKTREE_ID,
       'floating-group',
-      undefined,
-      { activate: false }
+      undefined
     )
-    expect(store.activateTab).toHaveBeenCalledWith('floating-tab-1')
+    // Why: createTab itself activates the new tab within the floating group.
+    expect(store.activateTab).not.toHaveBeenCalled()
     expect(focusTerminalTabSurfaceMock).toHaveBeenCalledWith('floating-tab-1')
   })
 
@@ -480,10 +481,10 @@ describe('createFloatingWorkspaceTerminalTab', () => {
     expect(store.createTab).toHaveBeenCalledWith(
       FLOATING_TERMINAL_WORKTREE_ID,
       'floating-group',
-      'pwsh',
-      { activate: false }
+      'pwsh'
     )
-    expect(store.activateTab).toHaveBeenCalledWith('floating-tab-runtime')
+    // Why: createTab itself activates the new tab within the floating group.
+    expect(store.activateTab).not.toHaveBeenCalled()
     expect(focusTerminalTabSurfaceMock).toHaveBeenCalledWith('floating-tab-runtime')
   })
 })

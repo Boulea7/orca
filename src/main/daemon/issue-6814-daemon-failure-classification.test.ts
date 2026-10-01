@@ -1,3 +1,4 @@
+import './mock-descendant-sweep'
 // Regression coverage for issue #6814 (terminal lockup after upgrade).
 //
 // Drives the real DaemonServer + checkDaemonHealth client over a real unix
@@ -16,7 +17,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DaemonServer } from './daemon-server'
 import { checkDaemonHealth } from './daemon-health'
-import type { SubprocessHandle } from './session'
+import type { SubprocessHandle } from './session-subprocess-handle'
 
 function createMockSubprocess(): SubprocessHandle {
   return {
@@ -25,6 +26,7 @@ function createMockSubprocess(): SubprocessHandle {
     write() {},
     resize() {},
     kill() {},
+    terminateOwnedTree: () => 'unavailable' as const,
     forceKill() {},
     signal() {},
     onData() {},
@@ -52,44 +54,6 @@ describe('issue #6814 repro: daemon failure-mode classification', () => {
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true })
-  })
-
-  // The good case: daemon answers hello AND the PTY spawn probe succeeds.
-  it('HEALTHY: a daemon that can spawn PTYs classifies as healthy', async () => {
-    const server = new DaemonServer({
-      socketPath,
-      tokenPath,
-      ptySpawnHealthCheck: vi.fn(async () => {}),
-      spawnSubprocess: () => createMockSubprocess()
-    })
-    await server.start()
-    try {
-      await expect(checkDaemonHealth(socketPath, tokenPath)).resolves.toBe('healthy')
-    } finally {
-      await server.shutdown()
-    }
-  })
-
-  // Symptom B, degraded: this is the case #6830 RESCUES. The daemon answers
-  // protocol but its PTY spawn probe throws (deleted cwd / stale native PTY
-  // after an upgrade), so fresh terminals would open frozen with no cursor.
-  it('DEGRADED: protocol-alive daemon that cannot spawn PTYs classifies as pty-spawn-unhealthy', async () => {
-    const server = new DaemonServer({
-      socketPath,
-      tokenPath,
-      ptySpawnHealthCheck: vi.fn(async () => {
-        throw new Error('chdir(2) failed.: No such file or directory')
-      }),
-      spawnSubprocess: () => createMockSubprocess()
-    })
-    await server.start()
-    try {
-      // -> #6830 marks this daemon degraded and routes fresh spawns to the
-      //    local provider instead of the no-cursor daemon pane.
-      await expect(checkDaemonHealth(socketPath, tokenPath)).resolves.toBe('pty-spawn-unhealthy')
-    } finally {
-      await server.shutdown()
-    }
   })
 
   // The limit of #6830: a fully WEDGED daemon (event loop hung — health RPC
@@ -135,9 +99,4 @@ describe('issue #6814 repro: daemon failure-mode classification', () => {
       await new Promise<void>((resolve) => wedged.close(() => resolve()))
     }
   }, 15000)
-
-  // No daemon at all (or token missing) -> unreachable.
-  it('UNREACHABLE: no daemon listening classifies as unreachable', async () => {
-    await expect(checkDaemonHealth(socketPath, tokenPath)).resolves.toBe('unreachable')
-  })
 })

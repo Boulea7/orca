@@ -1,12 +1,15 @@
 import { lstat } from 'node:fs/promises'
 import { basename, posix, resolve } from 'node:path'
-import { authorizeExternalPath, isENOENT } from './filesystem-auth'
+import { authorizeExternalPath } from './filesystem-auth'
+import { isENOENT } from './filesystem-path-containment'
 import { getSshConnectionManager } from './ssh'
 import { requireSshFilesystemProvider } from '../providers/ssh-filesystem-dispatch'
 import type { FileUploadSession, IFilesystemProvider } from '../providers/types'
-import type { ImportItemResult } from './filesystem-mutations'
+import type { ImportItemResult } from '../../shared/filesystem-import-result-types'
 import { assertSafeRemotePathSegment, type RemotePathFlavor } from '../ssh/ssh-remote-platform'
 import { isWindowsAbsolutePathLike } from '../../shared/cross-platform-path'
+import { runSshProviderContinuation } from '../ssh/ssh-provider-continuations'
+import { remotePathExists } from './filesystem-import-ssh-remote-existence'
 import {
   captureLocalUploadRoot,
   preScanSshImportDirectory,
@@ -16,6 +19,12 @@ import {
 // Why: the SSH import path uses SshFilesystemProvider instead of direct SFTP so
 // system-SSH transports (ProxyCommand/ProxyJump/FIDO2) get the same workflows.
 export async function importExternalPathsSsh(
+  ...args: Parameters<typeof importExternalPathsSshTracked>
+): Promise<{ results: ImportItemResult[] }> {
+  return runSshProviderContinuation(args[2], () => importExternalPathsSshTracked(...args))
+}
+
+async function importExternalPathsSshTracked(
   sourcePaths: string[],
   destDir: string,
   connectionId: string,
@@ -267,32 +276,4 @@ async function ensureDropStagingDir(
   }
   assertCurrent?.()
   await provider.createDir(destDir)
-}
-
-async function remotePathExists(
-  provider: IFilesystemProvider,
-  remotePath: string
-): Promise<boolean> {
-  try {
-    await provider.stat(remotePath)
-    return true
-  } catch (error) {
-    if (isRemoteMissingError(error)) {
-      return false
-    }
-    throw error
-  }
-}
-
-function isRemoteMissingError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false
-  }
-  const code = (error as NodeJS.ErrnoException).code
-  return (
-    code === 'ENOENT' ||
-    /\b(ENOENT|ENOTDIR)\b|no such file or directory|cannot find (?:the )?(?:file|path)|(?:file|path) not found/i.test(
-      error.message
-    )
-  )
 }

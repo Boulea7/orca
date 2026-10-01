@@ -3,6 +3,8 @@ import { SERVE_SUPERVISED_SHUTDOWN_GRACE_MS } from '../../shared/serve-supervisi
 import { SERVE_REPLACEMENT_READY_TIMEOUT_MS } from '../../shared/startup-readiness-deadlines'
 import { parseServeSupervisorMessage } from '../../shared/serve-update-handoff'
 import type { ServeRuntimeHealth } from './serve-runtime-health'
+import { ServeHealthDuration } from './serve-health-duration'
+import { probeServeHealthWithDeadline } from './serve-health-probe-deadline'
 
 export { SERVE_REPLACEMENT_READY_TIMEOUT_MS }
 export const SERVE_HEALTH_CHECK_INTERVAL_MS = 10_000
@@ -30,6 +32,7 @@ export type ServeChildExit = {
   signal: NodeJS.Signals | null
   readiness: ServeReadiness
   terminationRequested: boolean
+  signalWasForwarded: boolean
   userQuitRequested: boolean
   healthFailureReason: string | null
   healthyDurationMs: number
@@ -41,6 +44,8 @@ export function waitForForegroundServeChild(
   options: ServeChildMonitorOptions
 ): Promise<ServeChildExit> {
   return new Promise((resolveWait, reject) => {
+    const forwardsHangup = process.platform === 'linux'
+    const forwardedSignals = new Set<NodeJS.Signals>()
     let forceKillTimer: ReturnType<typeof setTimeout> | null = null
     let readyTimer: ReturnType<typeof setTimeout> | null = null
     let healthTimer: ReturnType<typeof setTimeout> | null = null
@@ -49,12 +54,15 @@ export function waitForForegroundServeChild(
     let terminationRequested = false
     let userQuitRequested = false
     let healthFailureReason: string | null = null
-    let healthySince: number | null = null
+    const healthyDuration = new ServeHealthDuration()
     let healthProbeInFlight = false
     let consecutiveHealthFailures = 0
     let settled = false
 
     const terminateChild = (): void => {
+      if (settled) {
+        return
+      }
       child.kill('SIGTERM')
       forceKillTimer ??= setTimeout(() => child.kill('SIGKILL'), SERVE_SUPERVISED_SHUTDOWN_GRACE_MS)
     }
@@ -85,7 +93,11 @@ export function waitForForegroundServeChild(
     }
     const forwardSignal = (signal: NodeJS.Signals): void => {
       terminationRequested = true
-      child.kill(signal)
+      // Windows delivers console Ctrl-C to both processes; another kill skips teardown.
+      if (process.platform !== 'win32') {
+        forwardedSignals.add(signal)
+        child.kill(signal)
+      }
       forceKillTimer ??= setTimeout(() => child.kill('SIGKILL'), SERVE_SUPERVISED_SHUTDOWN_GRACE_MS)
     }
     const scheduleHealthCheck = (runtimeId: string): void => {
@@ -97,32 +109,16 @@ export function waitForForegroundServeChild(
       }, options.healthCheckIntervalMs)
       healthTimer.unref?.()
     }
-    const probeHealthWithDeadline = async (): Promise<ServeRuntimeHealth> =>
-      await new Promise((resolveHealth) => {
-        let completed = false
-        const finish = (health: ServeRuntimeHealth): void => {
-          if (completed) {
-            return
-          }
-          completed = true
-          clearTimeout(timeout)
-          resolveHealth(health)
-        }
-        const timeout = setTimeout(
-          () => finish({ healthy: false, reason: 'runtime_unreachable' }),
-          options.healthProbeTimeoutMs
-        )
-        timeout.unref?.()
-        void Promise.resolve()
-          .then(() => options.healthProbe!())
-          .then(finish, () => finish({ healthy: false, reason: 'runtime_unreachable' }))
-      })
     const runHealthCheck = async (runtimeId: string): Promise<void> => {
-      const health = await probeHealthWithDeadline()
+      const health = await probeServeHealthWithDeadline(
+        () => options.healthProbe!(),
+        options.healthProbeTimeoutMs
+      )
       if (settled || userQuitRequested || readiness !== 'verified') {
         return
       }
       if (health.healthy && health.runtimeId === runtimeId) {
+        healthyDuration.accept()
         consecutiveHealthFailures = 0
         scheduleHealthCheck(runtimeId)
         return
@@ -133,10 +129,12 @@ export function waitForForegroundServeChild(
         health.runtimeId === runtimeId
       ) {
         // A promoted serve may be windowless while its runtime remains healthy.
+        healthyDuration.accept()
         consecutiveHealthFailures = 0
         scheduleHealthCheck(runtimeId)
         return
       }
+      healthyDuration.interrupt()
       consecutiveHealthFailures += 1
       if (consecutiveHealthFailures < options.healthFailureLimit) {
         scheduleHealthCheck(runtimeId)
@@ -164,7 +162,7 @@ export function waitForForegroundServeChild(
         return
       }
       readiness = 'verified'
-      healthySince = Date.now()
+      healthyDuration.accept()
       if (readyTimer) {
         clearTimeout(readyTimer)
         readyTimer = null
@@ -192,6 +190,10 @@ export function waitForForegroundServeChild(
       }
       if (message.type === 'orca:serve-user-quit') {
         userQuitRequested = true
+        forceKillTimer ??= setTimeout(
+          () => child.kill('SIGKILL'),
+          SERVE_SUPERVISED_SHUTDOWN_GRACE_MS
+        )
         if (readyTimer) {
           clearTimeout(readyTimer)
           readyTimer = null
@@ -233,6 +235,9 @@ export function waitForForegroundServeChild(
     const cleanup = (): void => {
       process.off('SIGINT', forwardSignal)
       process.off('SIGTERM', forwardSignal)
+      if (forwardsHangup) {
+        process.off('SIGHUP', forwardSignal)
+      }
       if (typeof child.off === 'function') {
         child.off('message', handleMessage)
       }
@@ -258,15 +263,19 @@ export function waitForForegroundServeChild(
           signal,
           readiness,
           terminationRequested,
+          signalWasForwarded: signal !== null && forwardedSignals.has(signal),
           userQuitRequested,
           healthFailureReason,
-          healthyDurationMs: healthySince === null ? 0 : Math.max(0, Date.now() - healthySince)
+          healthyDurationMs: healthyDuration.elapsed(options.healthProbe !== undefined)
         })
       )
     }
 
     process.on('SIGINT', forwardSignal)
     process.on('SIGTERM', forwardSignal)
+    if (forwardsHangup) {
+      process.on('SIGHUP', forwardSignal)
+    }
     if (typeof child.on === 'function') {
       child.on('message', handleMessage)
     }

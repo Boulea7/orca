@@ -5,6 +5,7 @@ import { foldMobileNativeChatMessages } from './mobile-native-chat-render-data'
 import type { MobileNativeChatImageAttachments } from './use-mobile-native-chat-image-attachments'
 import type { MobileNativeChatController } from './use-mobile-native-chat-controller'
 import { useMobileNativeChatStreamingBubble } from './use-mobile-native-chat-streaming-bubble'
+import { useMobileNativeChatQueuedSlot } from './use-mobile-native-chat-queued-slot'
 
 type Props = {
   controller: MobileNativeChatController
@@ -16,7 +17,7 @@ type Props = {
   images: MobileNativeChatImageAttachments
   onMicPress: () => void
   micActive: boolean
-  dictationMode: 'toggle' | 'hold'
+  dictationMode: string | undefined
   onMicPressIn: () => void
   onMicPressOut: () => void
   inputLockReason: MobileNativeChatInputLockReason | null
@@ -24,6 +25,10 @@ type Props = {
   sendErrorMessage: string | null
   /** Drops that failure once a later send succeeds. */
   onClearSendError: () => void
+  /** Stable host/worktree/tab identity for accepted-send completion fencing. */
+  sendSurfaceId: string
+  /** Reads the retained route's focus generation for accepted-send fencing. */
+  getSendCompletionGeneration: () => number
   keyboardInset: number
 }
 
@@ -43,6 +48,8 @@ export function MobileNativeChatOverlay({
   inputLockReason,
   sendErrorMessage,
   onClearSendError,
+  sendSurfaceId,
+  getSendCompletionGeneration,
   keyboardInset
 }: Props): React.JSX.Element | null {
   const session = controller.nativeChatSession
@@ -53,6 +60,16 @@ export function MobileNativeChatOverlay({
     controller.nativeChatStreamScopeKey,
     controller.nativeChatStreamLive
   )
+  const queued = controller.nativeChatQueued
+  const queuedSlot = useMobileNativeChatQueuedSlot({
+    cards: queued.cards,
+    onSend: queued.send,
+    onDelete: queued.delete,
+    onEdit: queued.edit,
+    pause: queued.pause,
+    onResume: queued.resume,
+    sessionKey: queued.sessionKey
+  })
   if (!controller.showNativeChat) {
     return null
   }
@@ -65,6 +82,12 @@ export function MobileNativeChatOverlay({
         error={session.error}
         agent={controller.nativeChatAgent}
         agentWorking={controller.nativeChatAgentWorking}
+        canStop={controller.nativeChatCanStop}
+        structuredActivityUi={controller.nativeChatStructured}
+        turnIndicator={controller.nativeChatTurnIndicator}
+        workingStartedAt={controller.nativeChatWorkingStartedAt}
+        settledTurns={controller.nativeChatSettledTurns}
+        turnJournal={controller.nativeChatTurnJournal}
         streaming={streaming}
         onStop={controller.handleNativeChatStop}
         ask={controller.nativeChatAsk}
@@ -72,15 +95,20 @@ export function MobileNativeChatOverlay({
         onDismissAsk={controller.dismissNativeChatAsk}
         onAnswerAsk={controller.handleNativeChatAnswerAsk}
         onCancelAsk={controller.handleNativeChatCancelAsk}
+        onCancelPrompt={controller.handleNativeChatCancelPrompt}
         question={controller.nativeChatQuestion}
         onAnswerQuestion={controller.handleNativeChatQuestionAnswer}
         permission={controller.nativeChatPermission}
         onRespondPermission={controller.handleNativeChatRespondPermission}
+        queuedSlot={queuedSlot}
         onOpenFile={onOpenFile}
         hasMore={session.hasMore}
         loadingEarlier={session.loadingEarlier}
         onLoadEarlier={session.loadEarlier}
         onSend={images.sendNativeChat}
+        sendSurfaceId={sendSurfaceId}
+        getSendCompletionGeneration={getSendCompletionGeneration}
+        getComposerEditGeneration={controller.getChatComposerEditGeneration}
         pending={controller.chatPending}
         imagePreviewsByMessageId={controller.chatImagePreviewsByMessageId}
         composerText={controller.chatComposerText}

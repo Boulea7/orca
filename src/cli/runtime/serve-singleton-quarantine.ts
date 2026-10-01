@@ -1,6 +1,22 @@
-import { link, lstat, readdir, readlink, rename, rmdir, symlink, unlink } from 'node:fs/promises'
+import {
+  lstat,
+  readdir,
+  readlink,
+  rename,
+  rmdir,
+  symlink,
+  unlink,
+  writeFile
+} from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { isServeProcessAlive } from './serve-process-liveness'
+import {
+  restoreExpectedSingletonLock as restoreExpectedLock,
+  removeRestoredSingletonBackups,
+  restoreSingletonCompanions,
+  restoreMovedSingletonLock as restoreMovedLock,
+  type MovedSingletonArtifact as MovedArtifact
+} from './serve-singleton-lock-restore'
 
 export const SINGLETON_ARTIFACT_NAMES = [
   'SingletonSocket',
@@ -12,25 +28,21 @@ export type SingletonQuarantineResult =
   | { state: 'quarantined'; paths: string[] }
   | { state: 'owner_changed' }
   | { state: 'owner_process_alive' }
-  | { state: 'failed'; errorCode?: string }
+  | { state: 'failed'; errorCode?: string; cleanupPaths?: string[] }
 
-type MovedArtifact = { source: string; target: string; name: string }
 type RecoveryGuardFailure = Extract<
   SingletonQuarantineResult,
   { state: 'owner_changed' | 'failed' }
 >
 
 const STALE_QUARANTINE_SUFFIX = /^stale-\d+-(\d+)$/
+const COMMIT_MARKER_PREFIX = 'SingletonRecoveryCommit.'
 
 export async function reconcileSingletonQuarantines(
   userDataPath: string,
   tempDirectory: string
 ): Promise<void> {
-  await removeAbandonedServeSingletonQuarantines(userDataPath, tempDirectory).catch((error) => {
-    process.stderr.write(
-      `[serve] could not remove abandoned singleton quarantine: ${error instanceof Error ? error.message : String(error)}\n`
-    )
-  })
+  await removeAbandonedServeSingletonQuarantines(userDataPath, tempDirectory)
 }
 
 export async function removeAbandonedServeSingletonQuarantines(
@@ -48,7 +60,7 @@ export async function removeAbandonedServeSingletonQuarantines(
   )
   const suffixes = new Set<string>()
   for (const entry of entries) {
-    for (const name of SINGLETON_ARTIFACT_NAMES) {
+    for (const name of [...SINGLETON_ARTIFACT_NAMES, 'SingletonRecoveryCommit']) {
       const prefix = `${name}.`
       if (!entry.startsWith(prefix)) {
         continue
@@ -56,7 +68,7 @@ export async function removeAbandonedServeSingletonQuarantines(
       const suffix = entry.slice(prefix.length)
       const match = STALE_QUARANTINE_SUFFIX.exec(suffix)
       const ownerPid = Number(match?.[1])
-      if (match && Number.isSafeInteger(ownerPid) && ownerPid > 0 && !isProcessAlive(ownerPid)) {
+      if (match && Number.isSafeInteger(ownerPid) && ownerPid > 0) {
         suffixes.add(suffix)
       }
     }
@@ -65,6 +77,26 @@ export async function removeAbandonedServeSingletonQuarantines(
     const paths = SINGLETON_ARTIFACT_NAMES.map((name) => `${name}.${suffix}`).filter((path) =>
       entries.has(path)
     )
+    if (!entries.has(COMMIT_MARKER_PREFIX + suffix)) {
+      if (isProcessAlive(Number(STALE_QUARANTINE_SUFFIX.exec(suffix)![1]))) {
+        throw new Error(`Unconfirmed singleton backup ${suffix}; recovery is still in progress.`)
+      }
+      const restored = paths.map((name) => ({
+        name,
+        source: join(userDataPath, name.slice(0, -suffix.length - 1)),
+        target: join(userDataPath, name)
+      }))
+      if (await removeRestoredSingletonBackups(restored)) {
+        continue
+      }
+      throw new Error(
+        `Unconfirmed singleton backup ${suffix}; refusing to discard ownership evidence.`
+      )
+    }
+    if (isProcessAlive(Number(STALE_QUARANTINE_SUFFIX.exec(suffix)![1]))) {
+      continue
+    }
+    paths.push(COMMIT_MARKER_PREFIX + suffix)
     await removeServeSingletonQuarantine(userDataPath, paths, tempDirectory)
   }
 }
@@ -74,25 +106,31 @@ export async function removeServeSingletonQuarantine(
   paths: readonly string[],
   tempDirectory?: string
 ): Promise<void> {
+  for (const path of paths) {
+    if (
+      basename(path) !== path ||
+      !(
+        SINGLETON_ARTIFACT_NAMES.some((name) => path.startsWith(`${name}.`)) ||
+        path.startsWith(COMMIT_MARKER_PREFIX)
+      )
+    ) {
+      throw new Error(`Invalid singleton quarantine path: ${path}`)
+    }
+  }
   const socketTarget = await readQuarantinedSocketTarget(userDataPath, paths)
   if (socketTarget && tempDirectory) {
     await removeScopedSocketDirectory(socketTarget, tempDirectory)
   }
-  await Promise.all(
-    paths.map(async (path) => {
-      if (
-        basename(path) !== path ||
-        !SINGLETON_ARTIFACT_NAMES.some((name) => path.startsWith(`${name}.`))
-      ) {
-        throw new Error(`Invalid singleton quarantine path: ${path}`)
+  const remove = async (path: string): Promise<void> => {
+    await unlink(join(userDataPath, path)).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
       }
-      await unlink(join(userDataPath, path)).catch((error) => {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw error
-        }
-      })
     })
-  )
+  }
+  // A failed artifact deletion must retain the evidence that makes a later retry safe.
+  await Promise.all(paths.filter((path) => !path.startsWith(COMMIT_MARKER_PREFIX)).map(remove))
+  await Promise.all(paths.filter((path) => path.startsWith(COMMIT_MARKER_PREFIX)).map(remove))
 }
 
 export async function quarantineSingletonArtifacts(
@@ -137,8 +175,6 @@ export async function quarantineSingletonArtifacts(
   }
 
   const moved: MovedArtifact[] = [lock]
-  let result: SingletonQuarantineResult
-  let guardReleaseFailure: RecoveryGuardFailure | null
   try {
     for (const name of SINGLETON_ARTIFACT_NAMES) {
       if (name === 'SingletonLock') {
@@ -152,46 +188,57 @@ export async function quarantineSingletonArtifacts(
       await rename(source, target)
       moved.push({ source, target, name })
     }
-    const movedNames = new Set(moved.map(({ name }) => name))
-    result = {
-      state: 'quarantined',
-      paths: SINGLETON_ARTIFACT_NAMES.filter((name) => movedNames.has(name)).map(
-        (name) => `${name}.${suffix}`
-      )
-    }
   } catch (error) {
-    for (const entry of moved.slice(1).toReversed()) {
-      await rename(entry.target, entry.source).catch(() => undefined)
-    }
+    await restoreSingletonCompanions(moved.slice(1))
     await restoreExpectedLock(lock, expectedLockTarget, recoveryGuardTarget)
-    result = quarantineFailure(error)
-  } finally {
-    guardReleaseFailure = await releaseRecoveryGuard(lock.source, recoveryGuardTarget)
+    return quarantineFailure(error)
   }
-  if (result.state === 'failed') {
-    if (guardReleaseFailure?.state === 'failed') {
-      process.stderr.write(
-        `[serve] could not release singleton recovery guard (${guardReleaseFailure.errorCode ?? 'unknown'}).\n`
-      )
-    }
-    return result
+  if (!confirmExpectedOwnerDead()) {
+    await restoreSingletonCompanions(moved.slice(1))
+    await restoreExpectedLock(lock, expectedLockTarget, recoveryGuardTarget)
+    return { state: 'owner_process_alive' }
   }
-  return guardReleaseFailure ?? result
+  const release = await releaseRecoveryGuard(lock.source, recoveryGuardTarget)
+  if (release.failure?.state === 'owner_changed' || (release.failure && !release.cleanupSafe)) {
+    return release.failure
+  }
+  const paths = SINGLETON_ARTIFACT_NAMES.filter((name) =>
+    moved.some((entry) => entry.name === name)
+  ).map((name) => `${name}.${suffix}`)
+  const marker = COMMIT_MARKER_PREFIX + suffix
+  try {
+    await writeFile(join(userDataPath, marker), '', { flag: 'wx', mode: 0o600 })
+    paths.push(marker)
+  } catch (error) {
+    return { ...quarantineFailure(error), cleanupPaths: paths }
+  }
+  return release.failure
+    ? { ...release.failure, cleanupPaths: paths }
+    : { state: 'quarantined', paths }
 }
 
 async function releaseRecoveryGuard(
   path: string,
   expectedTarget: string
-): Promise<RecoveryGuardFailure | null> {
+): Promise<{ failure: RecoveryGuardFailure | null; cleanupSafe: boolean }> {
+  let target: string
   try {
-    const target = await readlink(path)
-    if (target !== expectedTarget) {
-      return { state: 'owner_changed' }
-    }
-    await unlink(path)
-    return null
+    target = await readlink(path)
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? null : quarantineFailure(error)
+    const absent = (error as NodeJS.ErrnoException).code === 'ENOENT'
+    return { failure: absent ? null : quarantineFailure(error), cleanupSafe: absent }
+  }
+  if (target !== expectedTarget) {
+    return { failure: { state: 'owner_changed' }, cleanupSafe: false }
+  }
+  try {
+    await unlink(path)
+    return { failure: null, cleanupSafe: true }
+  } catch (error) {
+    return {
+      failure: (error as NodeJS.ErrnoException).code === 'ENOENT' ? null : quarantineFailure(error),
+      cleanupSafe: true
+    }
   }
 }
 
@@ -248,34 +295,6 @@ async function removeScopedSocketDirectory(
       throw error
     }
   })
-}
-
-async function restoreExpectedLock(
-  lock: MovedArtifact,
-  expectedLockTarget: string,
-  recoveryGuardTarget: string
-): Promise<void> {
-  if ((await readlink(lock.source).catch(() => null)) !== recoveryGuardTarget) {
-    return
-  }
-  await unlink(lock.source).catch(() => undefined)
-  await restoreMovedLock(lock.source, lock.target, expectedLockTarget)
-}
-
-async function restoreMovedLock(
-  source: string,
-  target: string,
-  movedLockTarget: string | null
-): Promise<void> {
-  try {
-    // Hard-linking restores an unreadable entry without overwriting a concurrent owner.
-    await (movedLockTarget ? symlink(movedLockTarget, source) : link(target, source))
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-      return
-    }
-  }
-  await unlink(target).catch(() => undefined)
 }
 
 async function exists(path: string): Promise<boolean> {

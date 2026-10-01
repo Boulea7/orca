@@ -27,6 +27,7 @@ export type ServeSingletonRecoveryResult =
         | 'health_probe_failed'
         | 'quarantine_failed'
       errorCode?: string
+      cleanupPaths?: string[]
     }
 
 type ServeSingletonRecoveryOptions = {
@@ -123,6 +124,7 @@ export async function recoverStaleServeSingleton(
       return {
         state: 'not-recoverable',
         reason: 'quarantine_failed',
+        ...(quarantine.cleanupPaths ? { cleanupPaths: quarantine.cleanupPaths } : {}),
         ...(quarantine.errorCode ? { errorCode: quarantine.errorCode } : {})
       }
     }

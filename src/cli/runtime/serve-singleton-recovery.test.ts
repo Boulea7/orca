@@ -260,7 +260,7 @@ describe.skipIf(process.platform === 'win32')('serve singleton recovery', () => 
     expect(await readlink(lockPath)).toBe(replacementTarget)
     expect(await pathExists(join(root, 'SingletonSocket'))).toBe(true)
     expect(await pathExists(join(root, 'SingletonCookie'))).toBe(true)
-    expect(await pathExists(join(root, 'SingletonLock.must-not-exist'))).toBe(false)
+    expect(await readlink(join(root, 'SingletonLock.must-not-exist'))).toBe(`${hostname()}-987654`)
   })
 
   it('restores the same-target owner when its pid becomes live under the recovery guard', async () => {

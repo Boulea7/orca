@@ -1,5 +1,9 @@
+import type { ZCodeInteractiveCapability } from '../../shared/zcode-missing-tui'
 import type { ProjectExecutionRuntimeResolution } from '../../shared/project-execution-runtime'
-import type { PathSource, ShellHydrationFailureReason } from '../../shared/types'
+import type {
+  PathSource,
+  ShellHydrationFailureReason
+} from '../../shared/shell-path-hydration-types'
 
 export type PreflightStatus = {
   git: { installed: boolean }
@@ -43,6 +47,8 @@ export type PreflightRuntimeContext = {
 export type PreflightApi = {
   check: (args?: PreflightRuntimeContext & { force?: boolean }) => Promise<PreflightStatus>
   detectAgents: (args?: PreflightRuntimeContext) => Promise<string[]>
+  /** Whether the installed `zcode` can open a session; cached in main per run. */
+  zcodeInteractiveCapability: () => Promise<ZCodeInteractiveCapability>
   refreshAgents: (args?: PreflightRuntimeContext) => Promise<RefreshAgentsResult>
   detectRemoteAgents: (args: { connectionId: string }) => Promise<string[]>
   detectRemoteWindowsTerminalCapabilities: (args: { connectionId: string }) => Promise<{

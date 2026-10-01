@@ -1,6 +1,7 @@
 import type React from 'react'
 
-import type { GlobalSettings, StatusBarItem } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
+import type { StatusBarItem } from '../../../../shared/ui-chrome-types'
 import type { FeatureInteractionId } from '../../../../shared/feature-interaction-catalog'
 import { SearchableSetting } from './SearchableSetting'
 import { AppearanceAdvancedDisclosure } from './AppearanceAdvancedDisclosure'
@@ -52,7 +53,8 @@ function recordStatusBarToggleInteraction(
     id === 'kimi' ||
     id === 'antigravity' ||
     id === 'minimax' ||
-    id === 'grok'
+    id === 'grok' ||
+    id === 'cursor'
   ) {
     recordFeatureInteraction('usage-tracking')
   }
@@ -202,8 +204,6 @@ export function AppearanceWindowSidebarSection({
                   title={translate('auto.components.settings.AppearancePane.dc29f3cc0d', 'Sidebar')}
                 />
                 <div className="ml-4 divide-y divide-border/40">
-                  {/* Why: this setting lives with the sidebar layout controls; Settings only
-                  names that ownership so we do not create a second stateful control. */}
                   <SearchableSetting
                     title={workspaceCardLayoutEntry.title}
                     description={workspaceCardLayoutEntry.description}

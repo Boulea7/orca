@@ -19,6 +19,12 @@ const DECTCEM_SHOW_CURSOR = '\x1b[?25h'
 // grok swaps it for `> ` on legacy Windows consoles, which is too generic to
 // match; those fall back to the quiet window and the caller's hard timeout.
 const GROK_COMPOSER_PROMPT = '❯'
+// Why: ZCode's composer box top-left corner (U+256D), painted once the input box mounts.
+// It is locale-independent — ZCode translates the placeholder and the mode label in the
+// box title, but not the frame — and its modal dialogs draw SQUARE corners, so this glyph
+// means the composer specifically. Anchored on the alternate-screen switch for the same
+// reason as grok: a powerline shell prompt can also draw `╭`.
+const ZCODE_COMPOSER_BOX_CORNER = '╭'
 const DECSET_ALT_SCREEN = '\x1b[?1049h'
 const DECRST_ALT_SCREEN = '\x1b[?1049l'
 
@@ -61,6 +67,25 @@ const DRAFT_PASTE_READY_SIGNALS: Record<DraftPasteReadySignal, DraftPasteReadySi
     // the main-process caller drops the draft when readiness never resolves.
     quietAnchor: DECSET_BRACKETED_PASTE
   },
+  // Why: DSH-TUI draws the same U+276F composer glyph inside the alternate screen, and
+  // animates its intro continuously behind it, so it needs grok's marker-plus-quiet shape
+  // rather than the default quiet window. Its own entry (not grok's) so the two agents'
+  // evidence — and any future divergence — stay separable.
+  'dsh-composer-prompt': {
+    markerAnchor: DECSET_ALT_SCREEN,
+    markerAnchorEnd: DECRST_ALT_SCREEN,
+    marker: GROK_COMPOSER_PROMPT,
+    quietAnchor: DECSET_BRACKETED_PASTE
+  },
+  'zcode-composer-prompt': {
+    markerAnchor: DECSET_ALT_SCREEN,
+    markerAnchorEnd: DECRST_ALT_SCREEN,
+    marker: ZCODE_COMPOSER_BOX_CORNER,
+    // Why: ZCode animates its ASCII banner forever, so the quiet window never settles on
+    // its own — but keep it armed as the floor for a build that renders inline and never
+    // switches to the alternate screen, where the marker anchor would never arm.
+    quietAnchor: DECSET_BRACKETED_PASTE
+  },
   'render-quiet-after-bracketed-paste': {
     markerAnchor: null,
     markerAnchorEnd: null,
@@ -88,7 +113,8 @@ export type DraftPasteReadyScanResult = {
  *
  * Per agent signal:
  *   - `codex-composer-prompt`: ready when the `›` glyph renders after DECSET
- *     2004; never arms the quiet window (`armQuietTimer` stays false).
+ *     2004, or when DECSET follows a glyph rendered while Codex owns the
+ *     alternate screen; never arms the quiet window.
  *   - `render-cursor-after-bracketed-paste`: ready when DECTCEM show-cursor
  *     (`\x1b[?25h`) renders after DECSET 2004. Like Codex it does NOT arm the
  *     quiet window: opencode stays silent for ~1.5-2s between enabling
@@ -110,6 +136,16 @@ export type DraftPasteReadyScanResult = {
  *     that keeps those launches on the pre-existing delivery path. The alt-screen
  *     anchor is revoked on `\x1b[?1049l`: leaving it hands the terminal back to
  *     the shell, so a glyph after that is the shell's prompt, not grok's composer.
+ *   - `dsh-composer-prompt`: the grok shape applied to DSH-TUI, whose composer draws the
+ *     same `❯` inside the alternate screen. The committed
+ *     `dsh-tui-ready-no-key.txt` transcript is the evidence: DECSET 2004 at byte 6,
+ *     `\x1b[?1049h` at byte 40, and the first `❯` at byte 5910.
+ *   - `zcode-composer-prompt`: ready when ZCode's composer box corner (`╭`) renders
+ *     after the alternate-screen switch. ZCode repaints its animated ASCII banner
+ *     indefinitely — the captured transcript is still repainting 30s after the composer
+ *     mounted — so the quiet window alone never settles and a launch draft would wait out
+ *     the whole hard timeout, exactly as grok did. Same alt-screen anchoring and
+ *     revocation as grok, because a powerline shell prompt can draw `╭` too.
  *   - `render-quiet-after-bracketed-paste` (default): no signal marker; arms the
  *     quiet window once DECSET 2004 is seen.
  *
@@ -122,8 +158,11 @@ export function createDraftPasteReadyScanner(readySignal: DraftPasteReadySignal)
   let recent = ''
   let postAnchorRecent = ''
   let anchorCarry = ''
+  let codexCarry = ''
   let sawMarkerAnchor = false
   let sawQuietAnchor = false
+  let codexAltScreen = false
+  let sawCodexPromptInAltScreen = false
 
   const {
     markerAnchor,
@@ -167,12 +206,46 @@ export function createDraftPasteReadyScanner(readySignal: DraftPasteReadySignal)
     return false
   }
 
+  const scanCodexPreAnchorPrompt = (data: string): void => {
+    const window = codexCarry + data
+    codexCarry = window.slice(-ANCHOR_CARRY_CHARS)
+    let cursor = 0
+    while (cursor < window.length) {
+      const enterIndex = window.indexOf(DECSET_ALT_SCREEN, cursor)
+      const leaveIndex = window.indexOf(DECRST_ALT_SCREEN, cursor)
+      const promptIndex = window.indexOf(CODEX_COMPOSER_PROMPT, cursor)
+      const nextIndex = Math.min(
+        ...[enterIndex, leaveIndex, promptIndex].filter((index) => index !== -1)
+      )
+      if (!Number.isFinite(nextIndex)) {
+        return
+      }
+      if (nextIndex === enterIndex) {
+        codexAltScreen = true
+        sawCodexPromptInAltScreen = false
+        cursor = nextIndex + DECSET_ALT_SCREEN.length
+      } else if (nextIndex === leaveIndex) {
+        codexAltScreen = false
+        sawCodexPromptInAltScreen = false
+        cursor = nextIndex + DECRST_ALT_SCREEN.length
+      } else {
+        if (codexAltScreen) {
+          sawCodexPromptInAltScreen = true
+        }
+        cursor = nextIndex + CODEX_COMPOSER_PROMPT.length
+      }
+    }
+  }
+
   return {
     observe(data: string): DraftPasteReadyScanResult {
       const combined = recent + data
       recent = combined.slice(-512)
       if (!sawQuietAnchor && quietAnchor !== null && combined.includes(quietAnchor)) {
         sawQuietAnchor = true
+      }
+      if (readySignal === 'codex-composer-prompt' && !sawMarkerAnchor) {
+        scanCodexPreAnchorPrompt(data)
       }
       if (signalMarker !== null && markerAnchor !== null) {
         if (markerAnchorEnd !== null) {
@@ -187,6 +260,9 @@ export function createDraftPasteReadyScanner(readySignal: DraftPasteReadySignal)
           const anchorIndex = combined.indexOf(markerAnchor)
           if (anchorIndex !== -1) {
             sawMarkerAnchor = true
+            if (readySignal === 'codex-composer-prompt' && sawCodexPromptInAltScreen) {
+              return { ready: true, armQuietTimer: false }
+            }
             const postAnchorChunk = combined.slice(anchorIndex + markerAnchor.length)
             if (postAnchorChunk.includes(signalMarker)) {
               return { ready: true, armQuietTimer: false }

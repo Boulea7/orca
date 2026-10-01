@@ -1,3 +1,5 @@
+import type { SshPendingPtyKill } from './ssh-pending-pty-kill'
+
 // ─── SSH Connection Types ───────────────────────────────────────────
 
 export const MIN_SSH_RELAY_GRACE_PERIOD_SECONDS = 60
@@ -6,6 +8,31 @@ export const LEGACY_DEFAULT_SSH_RELAY_GRACE_PERIOD_SECONDS = 3 * 60 * 60
 export const DEFAULT_BOUNDED_SSH_RELAY_GRACE_PERIOD_SECONDS = 24 * 60 * 60
 export const DEFAULT_SSH_RELAY_GRACE_PERIOD_SECONDS = 0
 export const SSH_RELAY_CONFIGURE_GRACE_TIME_METHOD = 'relay.configureGraceTime'
+
+/**
+ * Which runtime executes the SSH relay. `legacy` runs it on the host's Node with native deps
+ * installed on the host; `pinned-node` uploads Orca's pinned Node and prebuilt addons (design D5).
+ */
+export const SSH_REMOTE_RUNTIMES = ['legacy', 'pinned-node'] as const
+export type SshRemoteRuntime = (typeof SSH_REMOTE_RUNTIMES)[number]
+export const DEFAULT_SSH_REMOTE_RUNTIME: SshRemoteRuntime = 'legacy'
+
+/** Where the design D6 fallback ladder landed; `legacy` is the host-npm path outside it. */
+export const SSH_REMOTE_RUNTIME_RUNGS = ['A', 'B', 'C', 'D', 'legacy'] as const
+export type SshRemoteRuntimeRung = (typeof SSH_REMOTE_RUNTIME_RUNGS)[number]
+
+/**
+ * Main-owned record of the last ladder decision for a host. Valid only while its key
+ * (glibc, pinned runtime hash, Orca major) still matches, so an upgrade re-evaluates.
+ */
+export type SshRemoteRuntimeResolution = {
+  rung: SshRemoteRuntimeRung
+  /** The classified refusal that stepped off Orca's pinned Node, when one did. */
+  pinnedRefusal?: string
+  glibc: string | null
+  runtimeSha256: string
+  orcaMajor: number
+}
 
 export type SshTarget = {
   id: string
@@ -53,10 +80,29 @@ export type SshTarget = {
   /** Reuse a system OpenSSH connection across setup commands. Undefined means
    *  enabled; false is an explicit per-target compatibility opt-out. */
   systemSshConnectionReuse?: boolean
+  /** Relay runtime for this host; undefined means DEFAULT_SSH_REMOTE_RUNTIME. */
+  remoteRuntime?: SshRemoteRuntime
+  /** Main-owned ladder cache; renderer updates never set it. */
+  remoteRuntimeResolution?: SshRemoteRuntimeResolution
+  /** Durable registration incarnation. Advances on create / re-create / explicit
+   *  re-adopt only, so automations fenced on an old registration cannot run on a
+   *  later target that happens to reuse the id. Never advanced by connect state. */
+  generation?: number
 }
 
-/** Public target identity safe to mirror to a paired client. */
-export type SshTargetSummary = Pick<SshTarget, 'id' | 'label'>
+/** Renderer-authored target fields; registration generations are allocated and owned by main. */
+export type SshTargetCreateInput = Omit<SshTarget, 'id' | 'generation'>
+export type SshTargetUpdateInput = Partial<SshTargetCreateInput>
+
+/** Public target identity and observed host metadata safe to mirror to a paired client. */
+export type SshTargetSummary = Pick<SshTarget, 'id' | 'label' | 'generation'> & {
+  /** The SSH host's OS, when it has connected and the relay has detected it. */
+  remotePlatform?: SshRemotePlatform
+  /** Whether the target currently has a host-owned connected SSH lifecycle. */
+  connected?: boolean
+  /** Current SSH lifecycle state, when the desktop has one for this target. */
+  connectionStatus?: SshConnectionStatus
+}
 
 /** Identity of a removed SSH target, recorded so that re-adding the same host
  *  can re-point orphaned repos/worktrees from the old (deleted) target id to
@@ -181,6 +227,14 @@ export type SshConnectionState = {
   supportsFolderDownload?: boolean
   /** Remote OS detected by the SSH relay once available. */
   remotePlatform?: SshRemotePlatform
+  /** Set while connected without the Orca remote server (runtime ladder rung D). */
+  plainSsh?: SshPlainSshMode
+}
+
+/** Plain SSH terminals and SFTP browsing only; `reason` is the ladder's classified cause. */
+export type SshPlainSshMode = {
+  reason: string
+  message: string
 }
 
 /** Non-secret mutation provenance. Both fields are required when an SSH provider is selected. */
@@ -203,6 +257,36 @@ export type SshRemotePtyLease = {
   updatedAt: number
   lastAttachedAt?: number
   lastDetachedAt?: number
+  /** A stop this client asked for and could not confirm, replayed on the next handshake to this
+   *  same target. See `shared/ssh-pending-pty-kill.ts`. Never on the wire — client-local. */
+  pendingKill?: SshPendingPtyKill
+  /** Stored-form ptyId of the newer lease that won this pane, written only by supersession — which
+   *  already holds the winner in hand. Cleared whenever this id is re-upserted live, so a RECYCLED
+   *  relay id cannot inherit its predecessor's mark. */
+  supersededBy?: string
+  /** The host listed this ptyId under a different PTY incarnation, so the id no longer routes to
+   *  this lease's shell. Written only by the pending-stop replay's `relay-id-recycled` retirement. */
+  relayIdRecycled?: true
+}
+
+/**
+ * `expired` says only that the CLIENT lost its route, never that the remote shell died
+ * (docs/reference/ssh-execution-boundary.md), so it covers two unrelated cases. Two writers can
+ * prove the route is dead for good — a newer lease won the pane, or the relay handed the id to
+ * another shell — and re-adopting either is the 2 -> 19 -> 20 lease fan-out or a pane handed to a
+ * stranger's process. An `expired` lease carrying neither mark is an orphan, not a corpse, and a
+ * reattach is the only thing that can tell those apart.
+ */
+export function sshRemotePtyLeaseAllowsReattach(
+  lease: Pick<SshRemotePtyLease, 'state' | 'supersededBy' | 'relayIdRecycled'>
+): boolean {
+  if (lease.state === 'terminated') {
+    return false
+  }
+  return (
+    lease.state !== 'expired' ||
+    (lease.supersededBy === undefined && lease.relayIdRecycled !== true)
+  )
 }
 
 /** Main-owned relay lease needed to reclaim PTY delivery after a desktop restart. */
@@ -252,4 +336,14 @@ export type DetectedPort = {
 export type EnrichedDetectedPort = DetectedPort & {
   advertisedUrl?: string
   advertisedProtocol?: 'http' | 'https'
+}
+
+/** Outcome of `ssh:terminateSessions`. Uses the fixed verdict vocabulary from
+ *  docs/reference/ssh-execution-boundary.md: a host we could not reach yields `unverifiable`,
+ *  never `exited`, so an offline sweep can never be read as a successful remote kill (issue #12661). */
+export type SshTerminateSessionsResult = {
+  /** Remote PTYs the host acknowledged stopping. */
+  terminated: number
+  /** Leases whose remote shells were never reached because the relay was offline. */
+  unverifiable: number
 }

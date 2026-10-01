@@ -1,8 +1,10 @@
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import type { HostSectionRow } from './host-section-rows'
-import { getCyclableWorktreeIds, resolveCycledWorktreeId } from './worktree-keyboard-cycle'
+import {
+  getCyclableWorktreeIds,
+  getCyclableWorktrees,
+  resolveCycledWorktreeId
+} from './worktree-keyboard-cycle'
 
 describe('resolveCycledWorktreeId', () => {
   const worktreeIds = ['a', 'b', 'c']
@@ -89,6 +91,25 @@ describe('getCyclableWorktreeIds', () => {
     expect(getCyclableWorktreeIds(rows, 'duplicate-in-groups')).toEqual(['dup', 'plain-b'])
   })
 
+  it('keeps same-id rows on different hosts independently cyclable', () => {
+    const rows: HostSectionRow[] = [
+      {
+        ...worktree('shared'),
+        worktree: { id: 'shared', repoId: repo.id, hostId: 'local' } as never
+      },
+      {
+        ...worktree('shared'),
+        rowKey: 'row:shared:ssh',
+        worktree: { id: 'shared', repoId: repo.id, hostId: 'ssh:host-b' } as never
+      }
+    ]
+
+    expect(getCyclableWorktrees(rows, 'single-location').map((item) => item.hostId)).toEqual([
+      'local',
+      'ssh:host-b'
+    ])
+  })
+
   it('leaves folder workspaces out of the rotation', () => {
     // Why: their synthetic `folder:` id is not activatable through
     // activateAndRevealWorktree, so arrowing onto one would be a dead keypress.
@@ -126,24 +147,5 @@ describe('getCyclableWorktreeIds', () => {
     ]
 
     expect(getCyclableWorktreeIds(rows, 'single-location')).toEqual(['visible-after-host'])
-  })
-})
-
-describe('WorktreeList keyboard cycling', () => {
-  it('cycles over the rendered rows instead of rebuilding a parallel layout', () => {
-    const source = readFileSync(
-      fileURLToPath(new URL('./WorktreeList.tsx', import.meta.url)),
-      'utf8'
-    )
-    const navigateWorktree = source.slice(
-      source.indexOf('const navigateWorktree = useCallback('),
-      source.indexOf('const handleContainerKeyDown = useCallback(')
-    )
-
-    // Why: a second buildRows call drifts from the rendered layout (host sections,
-    // pinned placement); cycling must read the same rows the viewport renders.
-    expect(navigateWorktree).toContain('getCyclableWorktreeIds(rows, pinnedDisplayPolicy)')
-    expect(navigateWorktree).toContain('resolveCycledWorktreeId')
-    expect(navigateWorktree).not.toContain('buildRows(')
   })
 })

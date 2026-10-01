@@ -12,10 +12,12 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { AgentHookSource } from '../../shared/agent-hook-relay'
+import { quotePowerShellLiteral } from '../../shared/powershell-native-argument'
 import { grantDirAcl, isPermissionError } from '../win32-utils'
-import { POSIX_HOOK_STDIN_DRAIN_COMMAND } from './hook-stdin-contract'
 import { resolveHooksJsonWritePath } from './hook-config-write-path'
 import { writeRollingFileBackup } from '../rolling-file-backup'
+import { wrapWindowsPowerShellEncodedCommand } from './windows-powershell-hook-launcher'
+import { WINDOWS_POWERSHELL_HOOK_ENVIRONMENT_GUARD } from './hook-stdin-contract'
 
 export type HookCommandConfig = {
   type: 'command'
@@ -105,50 +107,48 @@ export function getSharedManagedScriptPath(scriptFileName: string): string {
   return join(homedir(), '.orca', 'agent-hooks', scriptFileName)
 }
 
-function quotePosixShellString(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`
-}
+export { wrapPosixHookCommand } from './posix-hook-command'
 
-// Why: guard for a readable executable so a stale entry at a missing script becomes a silent no-op, not an exit-127 failure on every tool call.
-export function wrapPosixHookCommand(scriptPath: string, env: Record<string, string> = {}): string {
-  // Why: single-quote escape so $, `, ", \ in scriptPath stay literal — avoids shell injection from an arbitrary path.
-  const quoted = quotePosixShellString(scriptPath)
-  const envPrefix = Object.entries(env)
-    .map(([key, value]) => `${key}='${value.replaceAll("'", "'\\''")}'`)
-    .join(' ')
-  const invocation = envPrefix ? `${envPrefix} /bin/sh ${quoted}` : `/bin/sh ${quoted}`
-  return `if [ -f ${quoted} ] && [ -r ${quoted} ] && [ -x ${quoted} ]; then ${invocation}; else ${POSIX_HOOK_STDIN_DRAIN_COMMAND}; fi`
-}
-
-function quotePowerShellString(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`
-}
-
-function getWindowsPowerShellExecutablePath(): string {
-  const systemRoot = process.env.SystemRoot || 'C:\\Windows'
-  // Why: PATH lookup lets a worktree-local powershell.exe hijack hook payloads.
-  // Forward slashes keep this absolute path shell-friendly for cmd.exe and Git Bash.
-  return `${systemRoot.replaceAll('\\', '/')}/System32/WindowsPowerShell/v1.0/powershell.exe`
-}
+export {
+  wrapWindowsPowerShellEncodedCommand,
+  WINDOWS_POWERSHELL_HOOK_SWITCHES
+} from './windows-powershell-hook-launcher'
 
 export function wrapWindowsHookCommand(
   scriptPath: string,
-  env: Record<string, string> = {}
+  env: Record<string, string> = {},
+  options: { fallbackStdout?: string } = {}
+): string {
+  return wrapWindowsPowerShellEncodedCommand(
+    buildWindowsHookPowerShellCommand(scriptPath, env, options)
+  )
+}
+
+export function buildWindowsHookPowerShellCommand(
+  scriptPath: string,
+  env: Record<string, string> = {},
+  // Why: POSIX wrap already answers missing-script with stdout; Windows must match so gate events cannot drift (#15462).
+  options: { fallbackStdout?: string } = {}
 ): string {
   // Why: the encoded launcher protects paths across Windows shells and drains stdin when the config points at a missing script.
-  const quoted = quotePowerShellString(scriptPath)
+  const quoted = quotePowerShellLiteral(scriptPath)
   const envPrefix = Object.entries(env)
-    .map(([key, value]) => `$env:${key} = ${quotePowerShellString(value)}; `)
+    .map(([key, value]) => `$env:${key} = ${quotePowerShellLiteral(value)}; `)
     .join('')
-  const command = `${envPrefix}if (Test-Path -LiteralPath ${quoted} -PathType Leaf) { & ${quoted}; exit $LASTEXITCODE }; [Console]::In.ReadToEnd() | Out-Null; exit 0`
-  const encodedCommand = Buffer.from(command, 'utf16le').toString('base64')
-  return `${getWindowsPowerShellExecutablePath()} -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`
+  const fallback =
+    options.fallbackStdout === undefined
+      ? ''
+      : `Write-Output ${quotePowerShellLiteral(options.fallbackStdout)}; `
+  // Why the order: answer first (a gate event reads silence as deny), then the shared
+  // env guard, and only then own stdin — outside an Orca pane the caller may abandon the
+  // pipe, and ReadToEnd would strand the launcher there forever (#11549).
+  return `${envPrefix}if (Test-Path -LiteralPath ${quoted} -PathType Leaf) { & ${quoted}; exit $LASTEXITCODE }; ${fallback}${WINDOWS_POWERSHELL_HOOK_ENVIRONMENT_GUARD}; [Console]::In.ReadToEnd() | Out-Null; exit 0`
 }
 
 export const WINDOWS_CMD_SAFE_PATH = /^[A-Za-z0-9_.:\\~-]+$/
 
 export function wrapWindowsCmdHookCommand(scriptPath: string): string {
-  // Why: Codex/Antigravity/Devin spawn the hook as argv[0], not via cmd.exe, so it must be one spawnable token; a cmd `if exist` launcher isn't (#8430).
+  // Direct-spawn consumers need one executable token; a cmd `if exist` fragment is not one (#8430).
   return WINDOWS_CMD_SAFE_PATH.test(scriptPath) ? scriptPath : wrapWindowsHookCommand(scriptPath)
 }
 
@@ -315,8 +315,12 @@ function writeScriptWithAclRetry(scriptPath: string, content: string): void {
 
 export function writeHooksJson(
   configPath: string,
-  config: HooksConfig,
-  options?: { preserveMode?: boolean }
+  // Why: only used for the fallback serialization, so any JSON-shaped config qualifies —
+  // ZCode nests its hook block under `hooks.events`, not Claude's `hooks.<Event>`.
+  config: Record<string, unknown>,
+  // Why: `serialized` lets a JSONC config (Devin) supply text edited in place, so the
+  // atomic write + rolling backup below stay shared instead of being reimplemented.
+  options?: { preserveMode?: boolean; defaultMode?: number; serialized?: string }
 ): void {
   const writePath = resolveHooksJsonWritePath(configPath)
   const dir = dirname(writePath)
@@ -325,9 +329,11 @@ export function writeHooksJson(
   // Why: temp+rename leaves the original untouched on a crash/disk-full mid-write.
   // Why randomUUID: avoids tmp-path collisions when two install() calls fire in the same millisecond.
   const tmpPath = join(dir, `.${Date.now()}-${randomUUID()}.tmp`)
-  const serialized = `${JSON.stringify(config, null, 2)}\n`
+  const serialized = options?.serialized ?? `${JSON.stringify(config, null, 2)}\n`
   const existingMode =
-    options?.preserveMode === true && existsSync(writePath) ? statSync(writePath).mode : undefined
+    options?.preserveMode === true && existsSync(writePath)
+      ? statSync(writePath).mode & 0o777
+      : options?.defaultMode
 
   // Why: skip the write (and therefore the .bak rotation) when the on-disk
   // content is already identical. Without this, every install() rewrites the
@@ -344,7 +350,11 @@ export function writeHooksJson(
   }
 
   try {
-    writeFileSync(tmpPath, serialized, { encoding: 'utf-8', mode: existingMode })
+    writeFileSync(tmpPath, serialized, { encoding: 'utf-8', mode: existingMode, flag: 'wx' })
+    if (existingMode !== undefined && process.platform !== 'win32') {
+      // Preserve requested permissions even with a stricter process umask.
+      chmodSync(tmpPath, existingMode)
+    }
     // Why: single rolling backup — one file, no accumulation in ~/.claude.
     // Protects against a merge-logic bug producing bad JSON; the original is
     // always recoverable from <configPath>.bak until the next write.

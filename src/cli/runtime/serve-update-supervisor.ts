@@ -24,6 +24,10 @@ export const SERVE_CRASH_BUDGET_RESET_MS = 5 * 60_000
 export const SERVE_CRASH_RESTART_DELAYS_MS = [1_000, 5_000, 15_000] as const
 export { SERVE_SUPERVISOR_STOP_EXIT_CODE } from '../../shared/serve-supervision'
 export {
+  SERVE_CHILD_FORCE_KILL_SCHEDULING_MARGIN_MS,
+  SERVE_SUPERVISED_SHUTDOWN_GRACE_MS as SERVE_CHILD_FORCE_KILL_GRACE_MS
+} from '../../shared/serve-supervision'
+export {
   SERVE_HEALTH_CHECK_INTERVAL_MS,
   SERVE_HEALTH_FAILURE_LIMIT,
   SERVE_HEALTH_PROBE_TIMEOUT_MS,
@@ -167,14 +171,14 @@ export async function superviseForegroundServe(
         singletonRetryUsed = false
       }
       if (result.terminationRequested) {
-        if (typeof result.code === 'number') {
-          return result.code
+        if (typeof result.code === 'number' || result.signalWasForwarded) {
+          return result.code ?? 0
         }
         throw serveSignalExitError(result.signal)
       }
       if (!args.healthProbe && !args.recoverSingleton) {
-        if (typeof result.code === 'number') {
-          return result.code
+        if (typeof result.code === 'number' || result.signalWasForwarded) {
+          return result.code ?? 0
         }
         throw serveSignalExitError(result.signal)
       }
@@ -186,6 +190,9 @@ export async function superviseForegroundServe(
           return SERVE_ALREADY_RUNNING_EXIT_CODE
         }
         const recovery = await args.recoverSingleton()
+        if (recovery.state === 'not-recoverable' && recovery.cleanupPaths) {
+          pendingSingletonQuarantine.push(...recovery.cleanupPaths)
+        }
         if (recovery.state !== 'recovered') {
           const reason =
             recovery.state === 'active-owner'
