@@ -1,4 +1,4 @@
-import { link, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type * as Filesystem from 'node:fs/promises'
@@ -13,17 +13,21 @@ const cleanupFault = vi.hoisted(() => ({
   path: '',
   remaining: 0,
   readlinkPath: '',
+  readlinkCode: 'EACCES',
   markerFlight: null as Promise<void> | null
 }))
 vi.mock('node:fs/promises', async (importOriginal) => {
   const filesystem = await importOriginal<typeof Filesystem>()
   return {
     ...filesystem,
-    readlink: (...args: Parameters<typeof filesystem.readlink>) => {
+    readlink: async (...args: Parameters<typeof filesystem.readlink>) => {
       if (String(args[0]) === cleanupFault.readlinkPath) {
-        return Promise.reject(
-          Object.assign(new Error('canonical target unreadable'), { code: 'EACCES' })
-        )
+        if (cleanupFault.readlinkCode === 'ENOENT') {
+          await filesystem.unlink(String(args[0]))
+        }
+        throw Object.assign(new Error('canonical target unreadable'), {
+          code: cleanupFault.readlinkCode
+        })
       }
       return filesystem.readlink(...args)
     },
@@ -57,6 +61,7 @@ describe.skipIf(process.platform === 'win32')('serve singleton quarantine cleanu
     cleanupFault.path = ''
     cleanupFault.remaining = 0
     cleanupFault.readlinkPath = ''
+    cleanupFault.readlinkCode = 'EACCES'
     cleanupFault.markerFlight = null
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
   })
@@ -81,8 +86,14 @@ describe.skipIf(process.platform === 'win32')('serve singleton quarantine cleanu
       await symlink(`live-${name}`, join(userDataPath, `${name}.${liveSuffix}`))
     }
     await symlink('unrelated', join(userDataPath, 'SingletonLock.stale-invalid'))
-    await writeFile(join(userDataPath, `SingletonRecoveryCommit.${deadSuffix}`), '')
-    await writeFile(join(userDataPath, `SingletonRecoveryCommit.${liveSuffix}`), '')
+    await symlink(
+      'orca-singleton-recovery-commit-v1',
+      join(userDataPath, `SingletonRecoveryCommit.${deadSuffix}`)
+    )
+    await symlink(
+      'orca-singleton-recovery-commit-v1',
+      join(userDataPath, `SingletonRecoveryCommit.${liveSuffix}`)
+    )
 
     await removeAbandonedServeSingletonQuarantines(
       userDataPath,
@@ -108,7 +119,7 @@ describe.skipIf(process.platform === 'win32')('serve singleton quarantine cleanu
     const marker = join(root, `SingletonRecoveryCommit.${suffix}`)
     const artifact = join(root, `SingletonLock.${suffix}`)
     await symlink('dead-owner', artifact)
-    await writeFile(marker, '')
+    await symlink('orca-singleton-recovery-commit-v1', marker)
     cleanupFault.path = artifact
     cleanupFault.remaining = 1
 
@@ -148,6 +159,55 @@ describe.skipIf(process.platform === 'win32')('serve singleton quarantine cleanu
       expect(await pathExists(backup)).toBe(true)
       expect(await pathExists(canonical)).toBe(state !== 'missing')
       expect(childEnv.ORCA_SERVE_SUPERVISED).toBeUndefined()
+    }
+  )
+
+  it.each(['legacy-file', 'directory', 'foreign-target', 'unreadable', 'vanished'])(
+    'preserves dead-recoverer backups with an unconfirmed %s marker',
+    async (kind) => {
+      const root = await mkdtemp(join(tmpdir(), 'orca-quarantine-unconfirmed-marker-'))
+      roots.push(root)
+      const suffix = 'stale-1000-2147483647'
+      const backup = join(root, `SingletonLock.${suffix}`)
+      const marker = join(root, `SingletonRecoveryCommit.${suffix}`)
+      await symlink('original-owner', backup)
+      if (kind === 'legacy-file') {
+        await writeFile(marker, '')
+      } else if (kind === 'directory') {
+        await mkdir(marker)
+      } else {
+        await symlink(
+          kind === 'foreign-target' ? 'foreign-commit-target' : 'orca-singleton-recovery-commit-v1',
+          marker
+        )
+      }
+      if (kind === 'unreadable' || kind === 'vanished') {
+        cleanupFault.readlinkPath = marker
+        cleanupFault.readlinkCode = kind === 'vanished' ? 'ENOENT' : 'EACCES'
+      }
+      const retained = (await readdir(root)).sort()
+      const childEnv: NodeJS.ProcessEnv = {}
+
+      const scan = removeAbandonedServeSingletonQuarantines(root, root, () => false)
+      if (kind === 'unreadable') {
+        await expect(scan).rejects.toMatchObject({ code: 'EACCES' })
+        await expect(prepareLinuxServeSupervision(root, root, childEnv)).rejects.toMatchObject({
+          code: 'EACCES'
+        })
+      } else {
+        await expect(scan).rejects.toThrow('refusing to discard ownership evidence')
+        await expect(prepareLinuxServeSupervision(root, root, childEnv)).rejects.toThrow(
+          'refusing to discard ownership evidence'
+        )
+      }
+      expect(childEnv.ORCA_SERVE_SUPERVISED).toBeUndefined()
+      expect(await pathExists(backup)).toBe(true)
+      expect(await pathExists(marker)).toBe(kind !== 'vanished')
+      expect((await readdir(root)).sort()).toEqual(
+        kind === 'vanished'
+          ? retained.filter((entry) => !entry.startsWith('SingletonRecoveryCommit.'))
+          : retained
+      )
     }
   )
 

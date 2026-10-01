@@ -1,15 +1,10 @@
-import {
-  lstat,
-  readdir,
-  readlink,
-  rename,
-  rmdir,
-  symlink,
-  unlink,
-  writeFile
-} from 'node:fs/promises'
+import { lstat, readdir, readlink, rename, rmdir, symlink, unlink } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { isServeProcessAlive } from './serve-process-liveness'
+import {
+  createSingletonRecoveryCommitMarker,
+  hasCommittedSingletonRecoveryMarker
+} from './serve-singleton-recovery-commit'
 import {
   restoreExpectedSingletonLock as restoreExpectedLock,
   removeRestoredSingletonBackups,
@@ -77,7 +72,12 @@ export async function removeAbandonedServeSingletonQuarantines(
     const paths = SINGLETON_ARTIFACT_NAMES.map((name) => `${name}.${suffix}`).filter((path) =>
       entries.has(path)
     )
-    if (!entries.has(COMMIT_MARKER_PREFIX + suffix)) {
+    if (
+      !entries.has(COMMIT_MARKER_PREFIX + suffix) ||
+      !(await hasCommittedSingletonRecoveryMarker(
+        join(userDataPath, COMMIT_MARKER_PREFIX + suffix)
+      ))
+    ) {
       if (isProcessAlive(Number(STALE_QUARANTINE_SUFFIX.exec(suffix)![1]))) {
         throw new Error(`Unconfirmed singleton backup ${suffix}; recovery is still in progress.`)
       }
@@ -148,6 +148,21 @@ export async function quarantineSingletonArtifacts(
   }
   // Verify the atomically moved lock, then hold the live path with our PID while companions move.
   try {
+    // Reusing a suffix would mix this batch with an earlier recovery's commit evidence.
+    for (const name of [...SINGLETON_ARTIFACT_NAMES, 'SingletonRecoveryCommit']) {
+      const occupied = await lstat(join(userDataPath, `${name}.${suffix}`)).then(
+        () => true,
+        (error: unknown) => {
+          if (quarantineFailure(error).errorCode !== 'ENOENT') {
+            throw error
+          }
+          return false
+        }
+      )
+      if (occupied) {
+        return { state: 'failed', errorCode: 'EEXIST' }
+      }
+    }
     await rename(lock.source, lock.target)
   } catch (error) {
     const errorCode = (error as NodeJS.ErrnoException).code
@@ -207,10 +222,10 @@ export async function quarantineSingletonArtifacts(
   ).map((name) => `${name}.${suffix}`)
   const marker = COMMIT_MARKER_PREFIX + suffix
   try {
-    await writeFile(join(userDataPath, marker), '', { flag: 'wx', mode: 0o600 })
+    await createSingletonRecoveryCommitMarker(join(userDataPath, marker))
     paths.push(marker)
   } catch (error) {
-    return { ...quarantineFailure(error), cleanupPaths: paths }
+    return quarantineFailure(error)
   }
   return release.failure
     ? { ...release.failure, cleanupPaths: paths }
